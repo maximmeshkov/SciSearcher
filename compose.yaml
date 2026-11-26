@@ -1,0 +1,17 @@
+services:
+  scisearcher:
+    build: .
+    image: scisearcher:local
+    restart: unless-stopped
+    ports:
+      - "${SCISEARCHER_BIND:-127.0.0.1}:${SCISEARCHER_PORT:-8738}:8080"
+    environment:
+      INDEXER_PASSWORD: ${INDEXER_PASSWORD:-}
+      OPENALEX_API_KEY: ${OPENALEX_API_KEY:-}
+      IEEE_API_KEY: ${IEEE_API_KEY:-}
+      CROSSREF_MAILTO: ${CROSSREF_MAILTO:-}
+    volumes:
+      - library-data:/data
+
+volumes:
+  library-data:

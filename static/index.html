@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SciSearcher — индекс научных статей</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">К списку статей</a>
+  <header class="masthead">
+    <span class="wordmark">SciSearcher</span>
+  </header>
+  <div class="layout">
+    <aside class="sidebar" aria-labelledby="libraries-heading">
+      <div class="sidebar-heading">
+        <h2 id="libraries-heading">Библиотеки</h2>
+        <button class="button button-icon" id="new-library" type="button"
+                aria-label="Создать библиотеку" title="Создать библиотеку">+</button>
+      </div>
+      <nav id="libraries" aria-label="Библиотеки"></nav>
+    </aside>
+
+    <main id="main" tabindex="-1">
+      <p id="notice" class="notice" role="status" hidden></p>
+      <section id="welcome" class="welcome">
+        <h1>Библиотеки</h1>
+        <p id="welcome-message">Загрузка списка…</p>
+        <button id="welcome-create" class="button primary" type="button" hidden>Создать библиотеку</button>
+      </section>
+      <section id="workspace" hidden>
+        <header class="library-header">
+          <div>
+            <h1 id="library-name"></h1>
+            <p id="library-summary" class="secondary"></p>
+            <div id="keywords" class="tag-list" aria-label="Ключевые слова"></div>
+          </div>
+          <div class="action-row">
+            <button id="edit-library" class="button" type="button">Настройки</button>
+            <button id="run-library" class="button primary" type="button">Искать сейчас</button>
+          </div>
+        </header>
+        <div class="run-strip">
+          <div>
+            <span id="run-status" class="badge"></span>
+            <span id="run-meta" class="secondary"></span>
+          </div>
+          <button id="show-runs" class="text-button" type="button">Журнал запусков</button>
+        </div>
+
+        <section class="article-section" aria-labelledby="articles-heading">
+          <div class="article-toolbar">
+            <div class="article-title">
+              <h2 id="articles-heading">Статьи</h2>
+              <span id="result-count" class="secondary"></span>
+            </div>
+            <div class="action-row">
+              <label class="checkbox export-choice">
+                <input id="full-text-only" type="checkbox"> Экспортировать только полный текст
+              </label>
+              <a id="export-md" class="button" download>Markdown</a>
+              <a id="export-jsonl" class="button" download>JSONL</a>
+            </div>
+          </div>
+          <form id="search-form" class="search-form" role="search">
+            <label class="sr-only" for="search">Поиск по статьям текущей библиотеки</label>
+            <input id="search" type="search" placeholder="Поиск по библиотеке" autocomplete="off">
+            <button class="button" type="submit">Найти</button>
+          </form>
+          <p id="results-message" class="secondary" role="status"></p>
+          <ul id="articles" class="articles" aria-label="Результаты поиска"></ul>
+          <nav id="pagination" class="pagination" aria-label="Страницы результатов" hidden>
+            <button class="button" id="previous-page" type="button">← Назад</button>
+            <span id="page-range" class="secondary"></span>
+            <button class="button" id="next-page" type="button">Дальше →</button>
+          </nav>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="library-dialog" aria-labelledby="editor-heading">
+    <header class="dialog-heading">
+      <h2 id="editor-heading">Библиотека</h2>
+      <button type="button" class="button button-icon" data-close="library-dialog" aria-label="Закрыть">×</button>
+    </header>
+    <form id="library-form">
+      <label>
+        Название
+        <input name="name" type="text" required maxlength="120" autofocus>
+      </label>
+      <div class="form-grid">
+        <label>
+          Ключевые слова и фразы
+          <textarea name="keywords" rows="4" required placeholder="По одному слову или фразе в строке"></textarea>
+        </label>
+        <label>
+          Исключить слова и фразы
+          <textarea name="exclude" rows="4" placeholder="По одному слову или фразе в строке"></textarea>
+        </label>
+      </div>
+      <label>
+        Правило совпадения
+        <select name="match">
+          <option value="any">Любое ключевое слово или фраза</option>
+          <option value="all">Все ключевые слова и фразы</option>
+        </select>
+      </label>
+      <fieldset>
+        <legend>Источники этой библиотеки</legend>
+        <div id="editor-sources"></div>
+        <button class="button" id="add-source" type="button">Добавить источник</button>
+      </fieldset>
+      <div class="form-grid schedule-grid">
+        <label>
+          Период поиска, дней
+          <input name="lookback_days" type="number" min="1" max="3650" step="1" required>
+        </label>
+        <label>
+          Запуск каждые, часов
+          <input name="interval_hours" type="number" min="1" max="720" step="1" required>
+        </label>
+      </div>
+      <label class="checkbox">
+        <input name="enabled" type="checkbox"> Искать по расписанию
+      </label>
+      <label class="checkbox">
+        <input name="download_open_access" type="checkbox"> Скачивать открытые PDF
+      </label>
+      <p id="editor-error" class="form-error" role="alert" hidden></p>
+      <footer class="dialog-actions">
+        <button type="button" class="button" data-close="library-dialog">Отмена</button>
+        <button type="submit" class="button primary" id="save-library">Сохранить</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="article-dialog" aria-labelledby="preview-heading">
+    <header class="dialog-heading">
+      <h2 id="preview-heading">Статья</h2>
+      <button type="button" class="button button-icon" data-close="article-dialog" aria-label="Закрыть">×</button>
+    </header>
+    <p id="preview-meta" class="secondary"></p>
+    <div class="action-row preview-actions">
+      <a id="preview-link" class="button" target="_blank" rel="noopener noreferrer" hidden>У издателя ↗</a>
+      <a id="preview-pdf" class="button" target="_blank" rel="noopener" hidden>Локальный PDF ↗</a>
+      <span id="preview-kind" class="badge"></span>
+    </div>
+    <p id="preview-status" class="secondary" role="status"></p>
+    <pre id="preview-text" tabindex="0" aria-label="Текст статьи"></pre>
+    <form id="attach-form" class="attach-form">
+      <label>
+        Добавить файл статьи
+        <span class="secondary">PDF, Markdown, TXT или JATS XML</span>
+        <input id="attach-file" type="file" accept=".pdf,.md,.markdown,.txt,.xml,.jats" required>
+      </label>
+      <button id="attach-button" class="button primary" type="submit">Загрузить</button>
+    </form>
+    <p id="attach-status" role="status" hidden></p>
+  </dialog>
+
+  <dialog id="runs-dialog" aria-labelledby="runs-heading">
+    <header class="dialog-heading">
+      <h2 id="runs-heading">Журнал запусков</h2>
+      <button type="button" class="button button-icon" data-close="runs-dialog" aria-label="Закрыть">×</button>
+    </header>
+    <div id="runs" class="runs"></div>
+  </dialog>
+</body>
+</html>
