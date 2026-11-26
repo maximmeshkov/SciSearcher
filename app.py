@@ -15,11 +15,12 @@ from urllib.parse import parse_qs, urlsplit
 
 from catalog import Catalog, content_kind, normalize, normalize_doi
 from documents import MAX_UPLOAD_BYTES, chunks, extract
-from sources import fetch, get_bytes, source_specs
+from sources import fetch_pages, get_bytes, source_specs
+from sources.openalex import cached_pdf
 
 
 STATIC = Path(__file__).resolve().parent / "static"
-RESULT_LIMIT = 100
+PAGE_SIZE = 500
 DOWNLOAD_LIMIT = 40
 
 
@@ -89,10 +90,10 @@ def library_config(data):
             sources.append(source)
     config = {"name": name, "keywords": keywords, "match": match, "exclude": phrases(data, "exclude"),
               "sources": sources}
-    for key, default, maximum in (("interval_hours", 24, 720), ("lookback_days", 30, 3650)):
+    for key, default, minimum, maximum in (("interval_hours", 24, 1, 720), ("lookback_days", 30, 0, 3650)):
         value = data.get(key, default)
-        if type(value) is not int or not 1 <= value <= maximum:
-            raise ValueError(f"Значение {key} должно быть целым числом от 1 до {maximum}.")
+        if type(value) is not int or not minimum <= value <= maximum:
+            raise ValueError(f"Значение {key} должно быть целым числом от {minimum} до {maximum}.")
         config[key] = value
     for key, default in (("enabled", True), ("download_open_access", True)):
         value = data.get(key, default)
@@ -123,13 +124,30 @@ def matcher(config):
 
 
 def standardized(paper, source):
+    if not isinstance(paper, dict):
+        raise ValueError("Ожидался объект публикации.")
+    if not isinstance(paper.get("title"), str) or not paper["title"].strip():
+        raise ValueError("У публикации отсутствует название.")
+
     kind = source["kind"]
     origin = f"{kind}:{source['url']}" if "url" in source else kind
     fields = {"title": 2000, "abstract": 50000, "published": 10, "venue": 500,
               "external_id": 500, "license": 500, "doi": 700}
-    result = {key: str(paper.get(key) or "").strip()[:size] for key, size in fields.items()}
+    for key in (*fields, "url", "pdf_url"):
+        value = paper.get(key, "")
+        if not isinstance(value, str):
+            raise ValueError(f"Поле {key} должно быть текстом.")
+        value.encode("utf-8")
+    for key in ("authors", "keywords"):
+        values = paper.get(key, [])
+        if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+            raise ValueError(f"Поле {key} должно быть списком строк.")
+        for value in values:
+            value.encode("utf-8")
+
+    result = {key: paper.get(key, "").strip()[:size] for key, size in fields.items()}
     result["doi"] = normalize_doi(result["doi"])
-    result["authors"] = [str(author)[:250] for author in (paper.get("authors") or [])[:150]]
+    result["authors"] = [author[:250] for author in paper.get("authors", [])[:150]]
     result["url"] = web_url(paper.get("url")) or ("https://doi.org/" + result["doi"] if result["doi"] else "")
     result["pdf_url"] = web_url(paper.get("pdf_url"))
     result["source"] = kind
@@ -138,12 +156,34 @@ def standardized(paper, source):
 
 
 class Indexer:
-    def __init__(self, catalog, *, search=fetch, download=get_bytes):
+    def __init__(self, catalog, *, search=fetch_pages, download=get_bytes):
         self.catalog = catalog
         self.search = search
         self.download = download
         self.wake = threading.Event()
         self.stop = threading.Event()
+
+    def fetch_pdf(self, article):
+        def check_pdf(raw):
+            if b"%PDF-" not in raw[:1024]:
+                raise ValueError("Сервер вернул файл, который не похож на PDF.")
+            return raw
+
+        try:
+            return check_pdf(self.download(article["pdf_url"], MAX_UPLOAD_BYTES, accept="application/pdf"))
+        except Exception as direct_error:
+            if not os.getenv("OPENALEX_API_KEY"):
+                raise
+            external_id = self.catalog.external_id(article["id"], "openalex")
+            if not external_id:
+                raise
+            try:
+                raw = cached_pdf(external_id, MAX_UPLOAD_BYTES, self.download)
+                if raw is not None:
+                    return check_pdf(raw)
+            except Exception as cache_error:
+                raise ValueError(f"{direct_error} · кэш OpenAlex — {cache_error}") from cache_error
+            raise
 
     def supervise(self):
         while not self.stop.is_set():
@@ -166,7 +206,8 @@ class Indexer:
         try:
             cfg = self.catalog.libraries(run["library_id"])[0]
             matches = matcher(cfg)
-            since = date.today() - timedelta(days=cfg["lookback_days"])
+            days = cfg["lookback_days"]
+            since = date.today() - timedelta(days=days) if days else date.min
             specs = {spec["kind"]: spec for spec in source_specs()}
             for source in cfg["sources"]:
                 spec = specs[source["kind"]]
@@ -176,24 +217,41 @@ class Indexer:
                 terms = [""] if spec["mode"] == "feed" else cfg["keywords"]
                 for keyword in terms:
                     try:
-                        papers = self.search(source, keyword, since, RESULT_LIMIT)
-                        successful_queries += 1
-                        if len(papers) >= RESULT_LIMIT:
-                            errors.append(f"{label} — достигнут предел выдачи ({RESULT_LIMIT}) по запросу {keyword or 'RSS'}.")
+                        rows = self.search(source, keyword, since, PAGE_SIZE)
+                        pages = iter((rows,)) if isinstance(rows, list) else iter(rows)
                     except Exception as error:
-                        errors.append(f"{label} — {str(error)[:300]}")
+                        errors.append(f"{label} · {keyword or 'RSS'} — {str(error)[:300]}")
                         continue
-                    for paper in papers:
-                        if paper.get("title") and matches(paper):
-                            article_id, new_membership = self.catalog.add_article(cfg["id"], standardized(paper, source))
-                            found.add(article_id)
-                            added += new_membership
+                    position = 0
+                    received_page = False
+                    while not self.stop.is_set():
+                        try:
+                            papers = next(pages)
+                            if not isinstance(papers, list):
+                                raise ValueError("Адаптер должен вернуть список публикаций.")
+                        except StopIteration:
+                            successful_queries += 1
+                            break
+                        except Exception as error:
+                            successful_queries += int(received_page)
+                            errors.append(f"{label} · {keyword or 'RSS'} — {str(error)[:300]}")
+                            break
+                        received_page = True
+                        for paper in papers:
+                            position += 1
+                            try:
+                                candidate = standardized(paper, source)
+                            except ValueError as error:
+                                errors.append(f"{label} — публикация {position}: {str(error)[:300]}")
+                                continue
+                            if matches(paper):
+                                article_id, new_membership = self.catalog.add_article(cfg["id"], candidate)
+                                found.add(article_id)
+                                added += new_membership
             if cfg["download_open_access"]:
                 for doc in self.catalog.pending(cfg["id"], DOWNLOAD_LIMIT):
                     try:
-                        raw = self.download(doc["pdf_url"], MAX_UPLOAD_BYTES, accept="application/pdf")
-                        if b"%PDF-" not in raw[:1024]:
-                            raise ValueError("Сервер вернул файл, который не похож на PDF.")
+                        raw = self.fetch_pdf(doc)
                     except Exception as error:
                         self.catalog.download_failed(doc["id"], str(error)[:300])
                         errors.append(f"Статья {doc['id']} — загрузка PDF: {str(error)[:200]}")
@@ -232,6 +290,10 @@ class Api(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         self.serve("PUT")
+
+    def log_request(self, code="-", size="-"):
+        if self.path != "/healthz" or code != 200:
+            super().log_request(code, size)
 
     def headers_for(self, status, mime, *, length=None, filename=None):
         self.send_response(status)
@@ -293,8 +355,11 @@ class Api(BaseHTTPRequestHandler):
 
     def serve(self, method):
         try:
-            self.authorize(method)
             route = urlsplit(self.path)
+            if method == "GET" and route.path == "/healthz":
+                self.health()
+                return
+            self.authorize(method)
             self.dispatch(method, route.path, parse_qs(route.query))
         except HttpError as error:
             self.send_json({"error": str(error)}, error.status)
@@ -305,6 +370,15 @@ class Api(BaseHTTPRequestHandler):
         except Exception:
             logging.exception("Ошибка HTTP")
             self.send_json({"error": "Внутренняя ошибка. Подробности в журнале сервиса."}, 500)
+
+    def health(self):
+        if self.server.worker is not None and not self.server.worker.is_alive():
+            self.send_json({"status": "unavailable"}, 503)
+            return
+        if not self.server.indexer.catalog.available():
+            self.send_json({"status": "unavailable"}, 503)
+            return
+        self.send_json({"status": "ok"})
 
     def dispatch(self, method, path, query):
         catalog = self.server.indexer.catalog
@@ -347,7 +421,10 @@ class Api(BaseHTTPRequestHandler):
                 return
             if method == "GET" and match[2] == "articles":
                 offset = max(0, min(10**8, int(query.get("offset", [0])[0])))
-                items, total = catalog.articles(library_id, query.get("search", [""])[0][:300], 50, offset)
+                scope = query.get("scope", ["all"])[0]
+                if scope not in ("all", "full_text", "pdf"):
+                    raise HttpError(400, "Неизвестный фильтр статей.")
+                items, total = catalog.articles(library_id, query.get("search", [""])[0][:300], 50, offset, scope=scope)
                 self.send_json({"items": items, "total": total, "limit": 50, "offset": offset})
                 return
             if method == "GET" and match[2] in ("export.md", "export.jsonl"):
@@ -384,14 +461,16 @@ class Api(BaseHTTPRequestHandler):
                 text, _ = extract(raw, format_name)
             except ValueError as error:
                 raise HttpError(422, str(error)) from error
-            catalog.attach(article_id, format_name, raw, text)
+            if not catalog.attach(article_id, format_name, raw, text):
+                raise HttpError(404, "Запись больше не существует. Обновите библиотеку и повторите загрузку.")
             self.send_json({"content_kind": "full_text", "local_pdf": format_name == "pdf" or
                             catalog.attachment(article_id, "pdf") is not None})
             return
         raise HttpError(404, "Действие не найдено.")
 
     def export(self, library, format_name, full_text_only):
-        rows = self.server.indexer.catalog.export_articles(library["id"], full_text_only)
+        catalog = self.server.indexer.catalog
+        rows = catalog.export_articles(library["id"], full_text_only)
         markdown = format_name == "md"
         mime = "text/markdown" if markdown else "application/x-ndjson"
         self.headers_for(200, mime + "; charset=utf-8", filename=f"library-{library['id']}.{format_name}")
@@ -411,8 +490,7 @@ class Api(BaseHTTPRequestHandler):
                 self.wfile.write("\n".join(lines).encode())
                 continue
             for index, chunk in enumerate(chunks(body or meta["title"])):
-                identity = article["doi"] or article["url"] or f"{article['title']}:{article['id']}"
-                point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"scisearcher:{identity}:{index}"))
+                point_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"scisearcher:{catalog.identity}:{article['id']}:{index}"))
                 row = meta | chunk | {"id": point_id, "article_id": article["id"],
                                       "library_id": library["id"], "library": library["name"], "authors": authors,
                                       "library_ids": sorted(map(int, article["library_ids"].split(","))),
@@ -420,10 +498,11 @@ class Api(BaseHTTPRequestHandler):
                 self.wfile.write((json.dumps(row, ensure_ascii=False) + "\n").encode())
 
 
-def make_server(host, port, indexer, password=""):
+def make_server(host, port, indexer, password="", *, worker=None):
     server = ThreadingHTTPServer((host, port), Api)
     server.indexer = indexer
     server.password = password
+    server.worker = worker
     return server
 
 
@@ -435,8 +514,8 @@ def main():
     config = args.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     indexer = Indexer(Catalog(config.data / "catalog.sqlite3"))
-    server = make_server(config.host, config.port, indexer, os.environ.get("INDEXER_PASSWORD", ""))
     worker = threading.Thread(target=indexer.supervise, daemon=True)
+    server = make_server(config.host, config.port, indexer, os.environ.get("INDEXER_PASSWORD", ""), worker=worker)
     worker.start()
     print(f"Индексер слушает http://{server.server_name}:{server.server_port}", flush=True)
     try:

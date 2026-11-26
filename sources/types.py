@@ -1,8 +1,6 @@
 """Types shared by the core and source adapters."""
 
-from __future__ import annotations
-
-from typing import Literal, NotRequired, Protocol, TypedDict
+from typing import Literal, NotRequired, Protocol, Required, TypedDict
 
 
 class Field(TypedDict):
@@ -12,6 +10,7 @@ class Field(TypedDict):
     required: bool
     max_length: int
     placeholder: NotRequired[str]
+    pattern: NotRequired[str]
 
 
 class SourceSpec(TypedDict):
@@ -22,9 +21,9 @@ class SourceSpec(TypedDict):
     fields: list[Field]
 
 
-class Candidate(TypedDict):
+class Candidate(TypedDict, total=False):
     source: str
-    title: str
+    title: Required[str]
     abstract: str
     doi: str
     url: str
@@ -34,7 +33,7 @@ class Candidate(TypedDict):
     venue: str
     external_id: str
     license: str
-    keywords: NotRequired[list[str]]
+    keywords: list[str]
 
 
 class Getter(Protocol):

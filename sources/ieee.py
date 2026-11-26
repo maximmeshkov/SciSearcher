@@ -35,9 +35,11 @@ def search(source: dict, keyword: str, since: date, limit: int, get: Getter) -> 
     if not key:
         raise ValueError("IEEE Xplore Metadata API требует IEEE_API_KEY")
     params = {
-        "apikey": key, "format": "json", "querytext": keyword, "start_year": since.year, "end_year": date.today().year,
+        "apikey": key, "format": "json", "querytext": keyword, "end_year": date.today().year,
         "max_records": limit, "sort_field": "article_number", "sort_order": "desc",
     }
+    if since != date.min:
+        params["start_year"] = since.year
     if issn := issn_filter(source):
         params["issn"] = issn.replace("-", "")
     response = fetch_json(get, "https://ieeexploreapi.ieee.org/api/v1/search/articles", params)

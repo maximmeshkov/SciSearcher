@@ -15,7 +15,7 @@ from urllib.request import Request, urlopen
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
-from app import Indexer, make_server, matcher
+from app import Indexer, make_server, matcher, standardized
 from catalog import Catalog
 from sources import _REGISTRY, fetch
 
@@ -60,9 +60,9 @@ class WorkflowTest(unittest.TestCase):
             return fetch(source, keyword, since, limit, get=self.fixture)
 
         self.indexer = Indexer(self.catalog, search=search, download=fake_download)
-        self.server = make_server("127.0.0.1", 0, self.indexer)
-        self.http = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.worker = threading.Thread(target=self.indexer.supervise, daemon=True)
+        self.server = make_server("127.0.0.1", 0, self.indexer, worker=self.worker)
+        self.http = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.http.start()
         self.worker.start()
         self.base = f"http://127.0.0.1:{self.server.server_port}"
@@ -174,6 +174,12 @@ class WorkflowTest(unittest.TestCase):
         self.request(f"/api/articles/{other_id}/file?format=xml", "PUT", xml, mime="application/xml")
         self.assertEqual(len(exported(general)), 2)
         self.assertIn(b"3 GHz", self.request(f"/api/libraries/{general}/export.md?full_text=1"))
+        general_stats = next(row for row in self.request("/api/libraries") if row["id"] == general)
+        self.assertEqual((general_stats["article_count"], general_stats["full_text_count"], general_stats["pdf_count"]), (2, 2, 1))
+        full_text = self.request(f"/api/libraries/{general}/articles?scope=full_text&search=Silicon")
+        self.assertEqual([item["id"] for item in full_text["items"]], [other_id])
+        with_pdf = self.request(f"/api/libraries/{general}/articles?scope=pdf")
+        self.assertEqual([item["id"] for item in with_pdf["items"]], [paper_id])
 
         self.request(f"/api/libraries/{general}/run", "POST", expected=202)
         self.assertEqual(self.wait_for_run(general, minimum_runs=2)["added"], 0)
@@ -185,6 +191,73 @@ class WorkflowTest(unittest.TestCase):
             self.assertTrue(matches({"title": f"{spelling} methods", "abstract": "Analysis of GaN."}))
         self.assertFalse(matches({"title": "GaN payload-pull"}))
         self.assertFalse(matches({"title": "GaN load-pull tutorial"}))
+
+    def test_openalex_cache_is_tried_after_a_failed_pdf_link(self):
+        library = self.add_library("Load-pull", ["load-pull"], [{"kind": "openalex"}], enabled=False)
+        def failed_download(url, limit, *, accept):
+            self.assertEqual((url, accept), (COPY, "application/pdf"))
+            raise ValueError("Publisher returned HTTP 502")
+
+        self.indexer.download = failed_download
+        with (patch.dict("os.environ", {"OPENALEX_API_KEY": "test-key"}),
+              patch("app.cached_pdf", return_value=self.pdf) as cache):
+            self.request(f"/api/libraries/{library}/run", "POST", expected=202)
+            run = self.wait_for_run(library)
+            self.assertEqual(run["downloaded"], 1)
+            self.assertEqual(cache.call_args.args[0], "https://openalex.org/W42")
+        [article] = self.request(f"/api/libraries/{library}/articles")["items"]
+        self.assertEqual(self.request(f"/api/articles/{article['id']}/pdf"), self.pdf)
+
+    def test_health_checks_catalog_and_worker_without_basic_auth(self):
+        self.server.password = "test-password"
+        self.request("/api/libraries", expected=401)
+        self.assertEqual(self.request("/healthz"), {"status": "ok"})
+        catalog_file = self.catalog.path
+        self.catalog.path = catalog_file.with_name("empty.sqlite3")
+        try:
+            self.assertEqual(self.request("/healthz", expected=503), {"status": "unavailable"})
+        finally:
+            self.catalog.path = catalog_file
+        self.indexer.stop.set()
+        self.indexer.wake.set()
+        self.worker.join(5)
+        self.assertEqual(self.request("/healthz", expected=503), {"status": "unavailable"})
+
+    def test_export_point_id_survives_new_doi_and_catalog_reopen(self):
+        library = self.add_library("Load-pull", ["load-pull"], [{"kind": "openalex"}], enabled=False)
+        source = {"kind": "rss", "url": "https://journal.example.net/feed.xml"}
+        candidate = {"title": "Load-pull", "url": "https://journal.example.net/load-pull"}
+        article_id, _ = self.catalog.add_article(library, standardized(candidate, source))
+        self.request(f"/api/articles/{article_id}/file?format=md", "PUT", b"# Measurement note", mime="text/markdown")
+        path = f"/api/libraries/{library}/export.jsonl?full_text=1"
+        point = json.loads(self.request(path))
+        self.assertIn("Measurement note", point["text"])
+        new_id, _ = self.catalog.add_article(library, standardized(candidate | {"doi": SAMPLE_DOI}, source))
+        self.assertEqual(new_id, article_id)
+        self.indexer.catalog = Catalog(self.catalog.path)
+        updated = json.loads(self.request(path))
+        self.assertEqual((updated["id"], updated["text"]), (point["id"], point["text"]))
+        self.assertEqual(updated["doi"], SAMPLE_DOI)
+
+    def test_edits_library_settings_and_reads_them_back(self):
+        first = self.add_library("Load-pull", ["load-pull"], [{"kind": "crossref"}], enabled=False)
+        second = self.add_library("GaN", ["GaN"], [{"kind": "openalex"}], enabled=False)
+        config = {"name": "Load-pull GaN", "keywords": ["load-pull", "GaN"], "exclude": ["tutorial"],
+                  "match": "all", "lookback_days": 730, "interval_hours": 24,
+                  "sources": [{"kind": "rss", "url": "https://journal.example.net/feed.xml"}],
+                  "enabled": False, "download_open_access": False}
+        self.request(f"/api/libraries/{first}", "PUT", config)
+        libraries = {row["id"]: row for row in self.request("/api/libraries")}
+        self.assertEqual({key: libraries[first][key] for key in config}, config)
+        self.assertEqual(libraries[second]["keywords"], ["GaN"])
+        self.assertEqual(self.request(f"/api/libraries/{first}/runs"), [])
+
+    def test_disappeared_article_returns_error_when_upload_cannot_be_saved(self):
+        library = self.add_library("Load-pull", ["load-pull"], [{"kind": "openalex"}], enabled=False)
+        article_id, _ = self.catalog.add_article(library, standardized({"title": "Load-pull"}, {"kind": "openalex"}))
+        with patch.object(self.catalog, "attach", return_value=False):
+            self.request(f"/api/articles/{article_id}/file?format=txt", "PUT", b"Test text", expected=404,
+                         mime="text/plain")
 
     def test_new_adapter_uses_registry_and_generic_fields(self):
         kind = "rf_catalog"

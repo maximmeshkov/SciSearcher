@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from collections.abc import Iterator
 from datetime import date
 
 from .common import ISSN_FIELD, fetch_json, is_reusable_license, issn_filter, publication_date, record, web_url
@@ -65,19 +66,26 @@ def _crossref_pdf(item) -> tuple[str, str]:
     return "", ""
 
 
-def search(source: dict, keyword: str, since: date, limit: int, get: Getter) -> list[Candidate]:
-    filters = ["from-pub-date:" + since.isoformat(), "until-pub-date:" + date.today().isoformat(), "type:journal-article"]
+def _query_params(source: dict, keyword: str, since: date, limit: int) -> dict:
+    filters = ["until-pub-date:" + date.today().isoformat(), "type:journal-article"]
+    if since != date.min:
+        filters.append("from-pub-date:" + since.isoformat())
     if issn := issn_filter(source):
         filters.append("issn:" + issn)
     params = {
         "query.bibliographic": keyword, "filter": ",".join(filters),
-        "rows": limit, "sort": "relevance",
+        "rows": max(1, min(limit, 1000)), "sort": "relevance",
+        "select": ("DOI,title,abstract,published,published-online,published-print,issued,"
+                   "URL,license,link,container-title,author"),
     }
     if email := os.getenv("CROSSREF_MAILTO"):
         params["mailto"] = email
-    response = _fetch_works(get, params)
+    return params
+
+
+def _records(items: list) -> list[Candidate]:
     rows = []
-    for item in (response.get("message") or {}).get("items") or []:
+    for item in items:
         pdf, license_url = _crossref_pdf(item)
         authors = [
             " ".join(filter(None, (a.get("given"), a.get("family")))) or a.get("name")
@@ -90,3 +98,37 @@ def search(source: dict, keyword: str, since: date, limit: int, get: Getter) -> 
             venue=(item.get("container-title") or [""])[0], authors=authors, external_id=item.get("DOI"),
         ))
     return rows
+
+
+def _message(get: Getter, params: dict) -> dict:
+    result = _fetch_works(get, params)
+    message = result.get("message") if isinstance(result, dict) else None
+    if not isinstance(message, dict) or not isinstance(message.get("items"), list):
+        raise ValueError("Crossref вернул ответ без списка публикаций.")
+    return message
+
+
+def search(source: dict, keyword: str, since: date, limit: int, get: Getter) -> list[Candidate]:
+    return _records(_message(get, _query_params(source, keyword, since, limit))["items"])
+
+
+def pages(source: dict, keyword: str, since: date, limit: int, get: Getter) -> Iterator[list[Candidate]]:
+    params = _query_params(source, keyword, since, limit)
+    params["cursor"] = "*"
+    seen_cursors = {"*"}
+    read = 0
+    while True:
+        message = _message(get, params)
+        items = message["items"]
+        read += len(items)
+        yield _records(items)
+        if len(items) < params["rows"]:
+            return
+        cursor = message.get("next-cursor")
+        total = message.get("total-results")
+        if cursor is None and isinstance(total, int) and total <= read:
+            return
+        if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+            raise ValueError("Crossref не вернул новый курсор для следующей страницы.")
+        seen_cursors.add(cursor)
+        params["cursor"] = cursor

@@ -281,12 +281,15 @@ def chunks(text: str, target: int = 1800, overlap: int = 180) -> Iterator[dict]:
     page = None
     lines = []
     fence = None
+    yielded = False
 
     def flush() -> Iterator[dict]:
+        nonlocal yielded
         context = {"page": page} if page is not None else {}
         if headings:
             context["section"] = " / ".join(title for _, title in headings)
         for part in _chunk_section("\n".join(lines).strip(), target, overlap):
+            yielded = True
             yield {"text": part, **context}
 
     for line in text.splitlines():
@@ -315,3 +318,6 @@ def chunks(text: str, target: int = 1800, overlap: int = 180) -> Iterator[dict]:
                 headings.pop()
             headings.append((level, heading[2].strip()))
     yield from flush()
+    if not yielded:
+        for part in _chunk_section(text.strip(), target, overlap):
+            yield {"text": part}

@@ -1,15 +1,21 @@
 "use strict";
 
 const byId = (id) => document.getElementById(id);
+const scopes = new Set(["all", "full_text", "pdf"]);
+const requestedScope = new URL(location.href).searchParams.get("scope");
 const contentNames = {
   full_text: "Полный текст",
   abstract: "Аннотация",
   metadata: "Метаданные",
 };
+const pdfProblemNames = {
+  failed: "Ошибка загрузки PDF",
+  no_text: "Текст из PDF не извлечён",
+};
 const runNames = {
   queued: "В очереди",
-  running: "Идёт поиск",
-  partial: "Есть ошибки",
+  running: "Идёт сбор",
+  partial: "С замечаниями",
   success: "Завершён",
   succeeded: "Завершён",
   complete: "Завершён",
@@ -24,6 +30,7 @@ const state = {
   libraries: [],
   id: new URL(location.href).searchParams.get("library"),
   search: "",
+  scope: scopes.has(requestedScope) ? requestedScope : "all",
   offset: 0,
   limit: 25,
   editorId: null,
@@ -106,6 +113,8 @@ function rememberSelection() {
   const url = new URL(location.href);
   if (state.id) url.searchParams.set("library", state.id);
   else url.searchParams.delete("library");
+  if (state.scope === "all") url.searchParams.delete("scope");
+  else url.searchParams.set("scope", state.scope);
   if (location.href !== url.href) history.replaceState(null, "", url);
 }
 
@@ -175,11 +184,18 @@ function renderLibrary() {
   const frequency = library.enabled ? "каждые " + library.interval_hours + " ч" : "ручной запуск";
   byId("library-summary").textContent = sources.join(", ") + " · " + frequency;
   byId("keywords").replaceChildren(...library.keywords.map((word) => make("span", "tag", word)));
+  for (const [id, count] of [
+    ["stat-articles", library.article_count],
+    ["stat-full-text", library.full_text_count],
+    ["stat-pdf", library.pdf_count],
+  ]) {
+    byId(id).textContent = Number.isInteger(count) ? numberFormat.format(count) : "—";
+  }
   const status = library.last_status;
   const runStatus = byId("run-status");
   runStatus.className = runClass(status);
   runStatus.textContent = runNames[status] || status || "Запусков ещё не было";
-  byId("run-meta").textContent = timestamp(library.last_run_at);
+  byId("run-meta").textContent = library.last_run_at ? "Последний запуск " + timestamp(library.last_run_at) : "";
   byId("run-library").disabled = status === "queued" || status === "running";
   updateExportLinks();
 }
@@ -235,6 +251,8 @@ function articleCard(article) {
     pdf.rel = "noopener";
     links.append(pdf);
   }
+  const pdfProblem = pdfProblemNames[article.download_status];
+  if (pdfProblem) links.append(make("span", "badge warning", pdfProblem));
   if (links.childElementCount) card.append(links);
   return card;
 }
@@ -252,7 +270,7 @@ async function loadArticles(indicate = false) {
     byId("pagination").hidden = true;
     show(resultsMessage, "Загрузка статей…", "secondary");
   }
-  const query = new URLSearchParams({ search: state.search, offset: state.offset });
+  const query = new URLSearchParams({ search: state.search, offset: state.offset, scope: state.scope });
   try {
     const response = await api(libraryPath(id) + "/articles?" + query);
     if (request !== state.listRequest || id !== state.id) return;
@@ -271,8 +289,11 @@ async function loadArticles(indicate = false) {
         }
       }
     }
-    show(resultsMessage, items.length > 0 ? "" : state.search
-      ? "По запросу ничего не найдено." : "Пока здесь нет статей. Запусти поиск по источникам.", "secondary");
+    const emptyMessage = state.search ? "По запросу ничего не найдено."
+      : state.scope === "full_text" ? "В этой библиотеке пока нет извлечённых полных текстов."
+      : state.scope === "pdf" ? "В этой библиотеке пока нет локальных PDF."
+      : "Пока здесь нет статей. Запусти поиск по источникам.";
+    show(resultsMessage, items.length ? "" : emptyMessage, "secondary");
     byId("pagination").hidden = total <= limit;
     byId("previous-page").disabled = offset === 0;
     byId("next-page").disabled = offset + limit >= total;
@@ -297,8 +318,8 @@ function refreshLibraries() {
       const current = selected();
       if (current && (!previous || previous.id !== current.id)) {
         await loadArticles(true);
-      } else if (current && (previous.last_status !== current.last_status ||
-          previous.last_run_at !== current.last_run_at || previous.article_count !== current.article_count)) {
+      } else if (current && ["last_status", "last_run_at", "article_count", "full_text_count", "pdf_count"]
+          .some((key) => previous[key] !== current[key])) {
         await loadArticles();
       }
       if (current && byId("runs-dialog").open) void loadRuns();
@@ -378,12 +399,15 @@ async function showEditor(library) {
   }
   state.editorId = library?.id ?? null;
   byId("editor-heading").textContent = library ? "Настройки библиотеки" : "Новая библиотека";
+  byId("retention-note").hidden = !library;
   const fields = byId("library-form").elements;
   fields.name.value = library?.name || "";
   fields.keywords.value = library?.keywords.join("\n") || "";
   fields.exclude.value = library?.exclude.join("\n") || "";
   fields.match.value = library?.match || "any";
-  fields.lookback_days.value = library?.lookback_days ?? 30;
+  fields.lookback_days.value = library?.lookback_days || 30;
+  fields.all_history.checked = library?.lookback_days === 0;
+  fields.lookback_days.disabled = fields.all_history.checked;
   fields.interval_hours.value = library?.interval_hours ?? 24;
   fields.enabled.checked = library?.enabled ?? true;
   fields.download_open_access.checked = library?.download_open_access ?? true;
@@ -416,7 +440,7 @@ async function saveLibrary(event) {
     exclude: lines(fields.exclude),
     match: fields.match.value,
     sources,
-    lookback_days: Number(fields.lookback_days.value),
+    lookback_days: fields.all_history.checked ? 0 : Number(fields.lookback_days.value),
     interval_hours: Number(fields.interval_hours.value),
     enabled: fields.enabled.checked,
     download_open_access: fields.download_open_access.checked,
@@ -525,6 +549,9 @@ function setPreviewFiles(article) {
   const kind = byId("preview-kind");
   kind.textContent = contentNames[article.content_kind] || article.content_kind;
   kind.className = article.content_kind === "full_text" ? "badge success" : "badge";
+  const pdfProblem = pdfProblemNames[article.download_status];
+  show(byId("preview-download"),
+    pdfProblem ? [pdfProblem, article.download_error].filter(Boolean).join(" · ") : "");
 }
 
 async function loadText(article) {
@@ -583,6 +610,8 @@ async function attachFile(event) {
     if (article === state.article) {
       article.content_kind = result.content_kind;
       article.local_pdf = result.local_pdf;
+      article.download_status = "downloaded";
+      article.download_error = "";
       setPreviewFiles(article);
       byId("attach-form").reset();
       const message = result.content_kind === "full_text" ? "Полный текст добавлен."
@@ -591,6 +620,7 @@ async function attachFile(event) {
       void loadText(article);
     }
     void loadArticles();
+    void refreshLibraries();
   } catch (error) {
     if (article === state.article) show(status, error.message, "form-error");
   } finally {
@@ -606,7 +636,11 @@ byId("new-library").addEventListener("click", () => showEditor());
 byId("welcome-create").addEventListener("click", () => showEditor());
 byId("edit-library").addEventListener("click", () => showEditor(selected()));
 byId("add-source").addEventListener("click", () => newSource().focus());
-byId("library-form").addEventListener("submit", saveLibrary);
+const libraryForm = byId("library-form");
+libraryForm.addEventListener("submit", saveLibrary);
+libraryForm.elements.all_history.addEventListener("change", (event) => {
+  libraryForm.elements.lookback_days.disabled = event.target.checked;
+});
 byId("run-library").addEventListener("click", runNow);
 byId("full-text-only").addEventListener("change", updateExportLinks);
 byId("show-runs").addEventListener("click", () => {
@@ -620,6 +654,17 @@ byId("search-form").addEventListener("submit", (event) => {
   event.preventDefault();
   state.search = byId("search").value.trim();
   state.offset = 0;
+  void loadArticles(true);
+});
+const scopeFilter = byId("scope-filter");
+for (const option of scopeFilter.querySelectorAll("input")) {
+  option.checked = option.value === state.scope;
+}
+scopeFilter.addEventListener("change", (event) => {
+  if (!scopes.has(event.target.value)) return;
+  state.scope = event.target.value;
+  state.offset = 0;
+  rememberSelection();
   void loadArticles(true);
 });
 byId("previous-page").addEventListener("click", () => {

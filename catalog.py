@@ -1,9 +1,11 @@
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 import unicodedata
-from contextlib import contextmanager
+import uuid
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote, urlsplit, urlunsplit
 
@@ -39,7 +41,19 @@ def aliases(paper):
     return keys
 
 
+ARTICLE_FIELDS = ("title", "doi", "authors", "venue", "published", "url", "pdf_url", "license")
+DOWNLOAD_FIELDS = ("body", "body_format", "download_status", "download_error", "retry_at", "download_attempts")
+
+
+def abstract_priority(text, source):
+    return bool(text), source != "ieee", len(text)
+
+
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS catalog_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS libraries (
     id INTEGER PRIMARY KEY,
     config TEXT NOT NULL,
@@ -70,6 +84,7 @@ CREATE TABLE IF NOT EXISTS article_keys (
     key TEXT PRIMARY KEY,
     article_id INTEGER NOT NULL REFERENCES articles(id)
 );
+CREATE INDEX IF NOT EXISTS article_keys_article_id ON article_keys (article_id);
 CREATE TABLE IF NOT EXISTS article_sources (
     article_id INTEGER NOT NULL REFERENCES articles(id),
     source TEXT NOT NULL,
@@ -112,6 +127,11 @@ class Catalog:
         with self.connection() as db:
             db.execute("PRAGMA journal_mode = WAL")
             db.executescript(SCHEMA)
+            db.execute("INSERT OR IGNORE INTO catalog_metadata VALUES ('identity', ?)", (str(uuid.uuid4()),))
+            self.identity = db.execute("SELECT value FROM catalog_metadata WHERE key = 'identity'").fetchone()[0]
+            # Merges can delete the highest article ID; never allocate it again.
+            db.execute("""INSERT OR IGNORE INTO catalog_metadata
+                SELECT 'last_article_id', COALESCE(MAX(id), 0) FROM articles""")
             db.execute("UPDATE runs SET status = 'queued' WHERE status = 'running'")
 
     @contextmanager
@@ -127,9 +147,22 @@ class Catalog:
         finally:
             db.close()
 
+    def available(self):
+        path = self.path.resolve().as_uri() + "?mode=ro"
+        try:
+            with closing(sqlite3.connect(path, uri=True, timeout=2)) as db:
+                db.execute("SELECT id FROM libraries LIMIT 1").fetchone()
+        except sqlite3.Error:
+            return False
+        return True
+
     def libraries(self, library_id=None):
         query = """SELECT l.*,
             (SELECT COUNT(*) FROM memberships m WHERE m.library_id = l.id) AS article_count,
+            (SELECT COUNT(*) FROM memberships m JOIN articles a ON a.id = m.article_id
+                WHERE m.library_id = l.id AND a.body <> '') AS full_text_count,
+            (SELECT COUNT(*) FROM memberships m JOIN attachments f ON f.article_id = m.article_id
+                WHERE m.library_id = l.id AND f.format = 'pdf') AS pdf_count,
             (SELECT started_at FROM runs r WHERE r.library_id = l.id ORDER BY id DESC LIMIT 1) AS last_run_at,
             (SELECT status FROM runs r WHERE r.library_id = l.id ORDER BY id DESC LIMIT 1) AS last_status
             FROM libraries l"""
@@ -139,7 +172,7 @@ class Catalog:
             params = (library_id,)
         with self.connection() as db:
             return [json.loads(row["config"]) | {
-                key: row[key] for key in ("id", "article_count", "last_run_at", "last_status")
+                key: row[key] for key in ("id", "article_count", "full_text_count", "pdf_count", "last_run_at", "last_status")
             } for row in db.execute(query + " ORDER BY l.id", params)]
 
     def save_library(self, config, library_id=None):
@@ -191,53 +224,104 @@ class Catalog:
             rows = db.execute("SELECT * FROM runs WHERE library_id = ? ORDER BY id DESC LIMIT 30", (library_id,))
             return [dict(row) | {"errors": json.loads(row["errors"])} for row in rows]
 
+    def _matching_articles(self, db, keys, doi):
+        hits = {}
+        for key in keys:
+            hit = db.execute("SELECT a.* FROM article_keys k JOIN articles a ON a.id = k.article_id WHERE k.key = ?",
+                             (key,)).fetchone()
+            if hit:
+                hits[hit["id"]] = hit
+        doi = doi or next((hit["doi"] for hit in hits.values() if hit["doi"]), "")
+        matches = []
+        for hit in hits.values():
+            if hit["doi"] and hit["doi"] != doi:
+                continue
+            if matches:
+                ids = [match["id"] for match in matches]
+                placeholders = ", ".join("?" for _ in ids)
+                conflict = db.execute(f"""SELECT b.article_id FROM attachments a JOIN attachments b
+                    ON b.format = a.format WHERE a.article_id = ? AND b.article_id IN ({placeholders})
+                    AND a.data <> b.data LIMIT 1""", (hit["id"], *ids)).fetchone()
+                if conflict:
+                    # One file per format is addressable. Keep both originals on conflict.
+                    logging.warning("Different attachments prevent merging articles %s and %s", hit["id"], conflict[0])
+                    continue
+            matches.append(hit)
+        return sorted(matches, key=lambda row: row["id"])
+
+    def _merge_articles(self, db, matches):
+        winner = dict(matches[0])
+        if len(matches) == 1:
+            return winner
+
+        winner_id = winner["id"]
+        best = max(matches, key=lambda row: abstract_priority(row["abstract"], row["abstract_source"]))
+        winner.update(abstract=best["abstract"], abstract_source=best["abstract_source"])
+        for article in matches[1:]:
+            duplicate_id = article["id"]
+            for field in ARTICLE_FIELDS:
+                winner[field] = winner[field] or article[field]
+            db.execute("UPDATE article_keys SET article_id = ? WHERE article_id = ?", (winner_id, duplicate_id))
+            db.execute("""INSERT OR IGNORE INTO article_sources
+                SELECT ?, source, origin, url FROM article_sources WHERE article_id = ?""", (winner_id, duplicate_id))
+            db.execute("""INSERT OR IGNORE INTO memberships
+                SELECT library_id, ? FROM memberships WHERE article_id = ?""", (winner_id, duplicate_id))
+            db.execute("""INSERT OR IGNORE INTO attachments
+                SELECT ?, format, data FROM attachments WHERE article_id = ?""", (winner_id, duplicate_id))
+            db.execute("DELETE FROM article_sources WHERE article_id = ?", (duplicate_id,))
+            db.execute("DELETE FROM memberships WHERE article_id = ?", (duplicate_id,))
+            db.execute("DELETE FROM attachments WHERE article_id = ?", (duplicate_id,))
+            db.execute("DELETE FROM articles WHERE id = ?", (duplicate_id,))
+
+        state = max(matches, key=lambda row: (bool(row["body"]), row["download_status"] == "pending",
+                                               row["download_status"] == "failed", row["download_status"] == "no_text"))
+        winner.update({field: state[field] for field in DOWNLOAD_FIELDS})
+        if pdf := (state if state["pdf_url"] else next((row for row in matches if row["pdf_url"]), None)):
+            winner.update(pdf_url=pdf["pdf_url"], license=pdf["license"])
+        return winner
+
     def add_article(self, library_id, paper):
         keys = aliases(paper)
         with self.connection(write=True) as db:
-            article = None
-            for key in keys:
-                hit = db.execute("SELECT a.* FROM article_keys k JOIN articles a ON a.id = k.article_id WHERE k.key = ?",
-                                 (key,)).fetchone()
-                if hit and (not paper["doi"] or not hit["doi"] or paper["doi"] == hit["doi"]):
-                    article = hit
-                    break
-            fields = ("title", "doi", "abstract", "authors", "venue", "published", "url", "pdf_url", "license")
-            data = {field: paper[field] for field in fields}
+            matches = self._matching_articles(db, keys, paper["doi"])
+            article = self._merge_articles(db, matches) if matches else None
+            data = {field: paper[field] for field in ARTICLE_FIELDS}
+            data["abstract"] = paper["abstract"]
             data["authors"] = json.dumps(data["authors"], ensure_ascii=False) if data["authors"] else ""
             data["abstract_source"] = paper["source"] if paper["abstract"] else ""
             if article:
-                for field in fields:
+                for field in ARTICLE_FIELDS:
                     data[field] = article[field] or data[field]
-                if article["abstract"]:
-                    data["abstract_source"] = article["abstract_source"]
-                    existing_is_ieee = article["abstract_source"] == "ieee"
-                    incoming_is_ieee = paper["source"] == "ieee"
-                    if paper["abstract"] and (existing_is_ieee > incoming_is_ieee or
-                            existing_is_ieee == incoming_is_ieee and len(paper["abstract"]) > len(article["abstract"])):
-                        data["abstract"] = paper["abstract"]
-                        data["abstract_source"] = paper["source"]
-                if not article["body"] and paper["pdf_url"] and article["download_status"] in ("failed", "no_text"):
+                if abstract_priority(article["abstract"], article["abstract_source"]) >= abstract_priority(
+                        data["abstract"], data["abstract_source"]):
+                    data.update(abstract=article["abstract"], abstract_source=article["abstract_source"])
+                if len(matches) > 1:
+                    data.update({field: article[field] for field in DOWNLOAD_FIELDS})
+                if data["pdf_url"]:
+                    data["license"] = article["license"] if article["pdf_url"] else paper["license"]
+                if (not article["body"] and paper["pdf_url"] and paper["pdf_url"] != article["pdf_url"]
+                        and article["download_status"] in ("failed", "no_text")):
                     # A later source may supply a working copy of the same publication.
-                    data["pdf_url"] = paper["pdf_url"]
-                    if data["pdf_url"] != article["pdf_url"]:
-                        data["license"] = paper["license"]
-                        db.execute("UPDATE articles SET retry_at = '', download_status = 'pending' WHERE id = ?",
-                                   (article["id"],))
+                    data.update(pdf_url=paper["pdf_url"], license=paper["license"],
+                                retry_at=now(), download_status="pending", download_error="")
             data["search_text"] = normalize(" ".join(data[field] for field in ("title", "doi", "abstract", "authors", "venue")))
             if article:
                 columns = ", ".join(f"{field} = ?" for field in data)
                 article_id = article["id"]
                 db.execute(f"UPDATE articles SET {columns} WHERE id = ?", (*data.values(), article_id))
             else:
+                article_id = int(db.execute("""UPDATE catalog_metadata SET value = CAST(value AS INTEGER) + 1
+                    WHERE key = 'last_article_id' RETURNING value""").fetchone()[0])
+                data["id"] = article_id
                 columns = ", ".join(data)
                 slots = ", ".join("?" for _ in data)
-                article_id = db.execute(f"INSERT INTO articles ({columns}) VALUES ({slots})", tuple(data.values())).lastrowid
+                db.execute(f"INSERT INTO articles ({columns}) VALUES ({slots})", tuple(data.values()))
             db.executemany("INSERT OR IGNORE INTO article_keys VALUES (?, ?)", [(key, article_id) for key in keys])
             db.execute("INSERT OR IGNORE INTO article_sources VALUES (?, ?, ?, ?)",
                        (article_id, paper["source"], paper["origin"], paper["url"]))
             added = db.execute("INSERT OR IGNORE INTO memberships VALUES (?, ?)", (library_id, article_id)).rowcount
-            db.execute("UPDATE articles SET download_status = 'pending' WHERE id = ? AND pdf_url <> '' "
-                       "AND download_status = 'unavailable'", (article_id,))
+            db.execute("UPDATE articles SET download_status = 'pending', retry_at = ? WHERE id = ? AND pdf_url <> '' "
+                       "AND download_status = 'unavailable'", (now(), article_id))
             return article_id, added
 
     def pending(self, library_id, limit):
@@ -246,7 +330,7 @@ class Catalog:
                 JOIN articles a ON a.id = m.article_id
                 WHERE m.library_id = ? AND a.download_status IN ('pending', 'failed')
                 AND a.pdf_url <> '' AND a.body = '' AND a.retry_at <= ?
-                ORDER BY a.download_attempts, a.id DESC LIMIT ?""", (library_id, now(), limit)))
+                ORDER BY a.retry_at, a.id LIMIT ?""", (library_id, now(), limit)))
 
     def download_failed(self, article_id, reason):
         with self.connection(write=True) as db:
@@ -278,9 +362,21 @@ class Catalog:
         with self.connection() as db:
             return db.execute("SELECT * FROM articles WHERE id = ?", (article_id,)).fetchone()
 
-    def articles(self, library_id, search, limit, offset):
+    def external_id(self, article_id, origin):
+        prefix = origin + ":"
+        with self.connection() as db:
+            row = db.execute("""SELECT key FROM article_keys
+                WHERE article_id = ? AND substr(key, 1, ?) = ? ORDER BY key LIMIT 1""",
+                             (article_id, len(prefix), prefix)).fetchone()
+        return row["key"][len(prefix):] if row else ""
+
+    def articles(self, library_id, search, limit, offset, *, scope="all"):
         conditions = " FROM memberships m JOIN articles a ON a.id = m.article_id WHERE m.library_id = ?"
         params = [library_id]
+        if scope == "full_text":
+            conditions += " AND a.body <> ''"
+        elif scope == "pdf":
+            conditions += " AND EXISTS(SELECT 1 FROM attachments f WHERE f.article_id = a.id AND f.format = 'pdf')"
         if search:
             conditions += " AND instr(a.search_text, ?) > 0"
             params.append(normalize(search))

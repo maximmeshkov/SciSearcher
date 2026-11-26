@@ -9,11 +9,15 @@
 </head>
 <body>
   <a class="skip-link" href="#main">К списку статей</a>
-  <header class="masthead">
-    <span class="wordmark">SciSearcher</span>
-  </header>
   <div class="layout">
     <aside class="sidebar" aria-labelledby="libraries-heading">
+      <header class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div>
+          <span class="wordmark">SciSearcher</span>
+          <span class="brand-caption">Научная литература</span>
+        </div>
+      </header>
       <div class="sidebar-heading">
         <h2 id="libraries-heading">Библиотеки</h2>
         <button class="button button-icon" id="new-library" type="button"
@@ -25,13 +29,14 @@
     <main id="main" tabindex="-1">
       <p id="notice" class="notice" role="status" hidden></p>
       <section id="welcome" class="welcome">
+        <span class="brand-mark welcome-mark" aria-hidden="true"></span>
         <h1>Библиотеки</h1>
         <p id="welcome-message">Загрузка списка…</p>
         <button id="welcome-create" class="button primary" type="button" hidden>Создать библиотеку</button>
       </section>
       <section id="workspace" hidden>
         <header class="library-header">
-          <div>
+          <div class="library-intro">
             <h1 id="library-name"></h1>
             <p id="library-summary" class="secondary"></p>
             <div id="keywords" class="tag-list" aria-label="Ключевые слова"></div>
@@ -41,6 +46,20 @@
             <button id="run-library" class="button primary" type="button">Искать сейчас</button>
           </div>
         </header>
+        <dl class="library-stats" aria-label="Состав библиотеки">
+          <div class="stat">
+            <dt>Статьи</dt>
+            <dd id="stat-articles">—</dd>
+          </div>
+          <div class="stat">
+            <dt>Полные тексты</dt>
+            <dd id="stat-full-text">—</dd>
+          </div>
+          <div class="stat">
+            <dt>Локальные PDF</dt>
+            <dd id="stat-pdf">—</dd>
+          </div>
+        </dl>
         <div class="run-strip">
           <div>
             <span id="run-status" class="badge"></span>
@@ -52,22 +71,30 @@
         <section class="article-section" aria-labelledby="articles-heading">
           <div class="article-toolbar">
             <div class="article-title">
-              <h2 id="articles-heading">Статьи</h2>
+              <h2 id="articles-heading">Каталог</h2>
               <span id="result-count" class="secondary"></span>
             </div>
-            <div class="action-row">
+            <div class="action-row export-actions" role="group" aria-label="Экспорт библиотеки">
               <label class="checkbox export-choice">
-                <input id="full-text-only" type="checkbox"> Экспортировать только полный текст
+                <input id="full-text-only" type="checkbox"> Только полные тексты
               </label>
               <a id="export-md" class="button" download>Markdown</a>
               <a id="export-jsonl" class="button" download>JSONL</a>
             </div>
           </div>
-          <form id="search-form" class="search-form" role="search">
-            <label class="sr-only" for="search">Поиск по статьям текущей библиотеки</label>
-            <input id="search" type="search" placeholder="Поиск по библиотеке" autocomplete="off">
-            <button class="button" type="submit">Найти</button>
-          </form>
+          <div class="browse-toolbar">
+            <form id="search-form" class="search-form" role="search">
+              <label class="sr-only" for="search">Поиск по метаданным статей текущей библиотеки</label>
+              <input id="search" type="search" placeholder="Название, автор, DOI" autocomplete="off">
+              <button class="button" type="submit">Найти</button>
+            </form>
+            <fieldset class="scope-filter" id="scope-filter">
+              <legend class="sr-only">Показывать статьи с</legend>
+              <label><input type="radio" name="scope" value="all" checked><span>Все</span></label>
+              <label><input type="radio" name="scope" value="full_text"><span>С полным текстом</span></label>
+              <label><input type="radio" name="scope" value="pdf"><span>С PDF</span></label>
+            </fieldset>
+          </div>
           <p id="results-message" class="secondary" role="status"></p>
           <ul id="articles" class="articles" aria-label="Результаты поиска"></ul>
           <nav id="pagination" class="pagination" aria-label="Страницы результатов" hidden>
@@ -86,48 +113,60 @@
       <button type="button" class="button button-icon" data-close="library-dialog" aria-label="Закрыть">×</button>
     </header>
     <form id="library-form">
-      <label>
-        Название
-        <input name="name" type="text" required maxlength="120" autofocus>
-      </label>
-      <div class="form-grid">
-        <label>
-          Ключевые слова и фразы
-          <textarea name="keywords" rows="4" required placeholder="По одному слову или фразе в строке"></textarea>
-        </label>
-        <label>
-          Исключить слова и фразы
-          <textarea name="exclude" rows="4" placeholder="По одному слову или фразе в строке"></textarea>
-        </label>
+      <div class="settings-body">
+        <section class="settings-section" aria-labelledby="search-settings-heading">
+          <h3 id="search-settings-heading">Правила поиска</h3>
+          <label>
+            Название библиотеки
+            <input name="name" type="text" required maxlength="120" autofocus>
+          </label>
+          <div class="form-grid">
+            <label>
+              Ключевые слова и фразы
+              <textarea name="keywords" rows="3" required placeholder="По одной фразе в строке"></textarea>
+            </label>
+            <label>
+              Исключить слова и фразы
+              <textarea name="exclude" rows="3" placeholder="По одной фразе в строке"></textarea>
+            </label>
+          </div>
+          <label>
+            Правило совпадения
+            <select name="match">
+              <option value="any">Любое ключевое слово или фраза</option>
+              <option value="all">Все ключевые слова и фразы</option>
+            </select>
+          </label>
+          <p class="secondary" id="retention-note" hidden>Новые правила действуют со следующего запуска. Уже найденные статьи остаются в библиотеке.</p>
+        </section>
+        <fieldset class="settings-sources">
+          <legend>Источники этой библиотеки</legend>
+          <div id="editor-sources"></div>
+          <button class="button" id="add-source" type="button">+ Добавить источник</button>
+        </fieldset>
+        <section class="settings-section" aria-labelledby="schedule-settings-heading">
+          <h3 id="schedule-settings-heading">Расписание и загрузка</h3>
+          <div class="form-grid schedule-grid">
+            <label>
+              Период поиска, дней
+              <input name="lookback_days" type="number" min="1" max="3650" step="1" required>
+            </label>
+            <label>
+              Интервал запуска, часов
+              <input name="interval_hours" type="number" min="1" max="720" step="1" required>
+            </label>
+          </div>
+          <label class="checkbox">
+            <input name="all_history" type="checkbox"> Искать за всё доступное время
+          </label>
+          <label class="checkbox">
+            <input name="enabled" type="checkbox"> Искать по расписанию
+          </label>
+          <label class="checkbox">
+            <input name="download_open_access" type="checkbox"> Скачивать открытые PDF
+          </label>
+        </section>
       </div>
-      <label>
-        Правило совпадения
-        <select name="match">
-          <option value="any">Любое ключевое слово или фраза</option>
-          <option value="all">Все ключевые слова и фразы</option>
-        </select>
-      </label>
-      <fieldset>
-        <legend>Источники этой библиотеки</legend>
-        <div id="editor-sources"></div>
-        <button class="button" id="add-source" type="button">Добавить источник</button>
-      </fieldset>
-      <div class="form-grid schedule-grid">
-        <label>
-          Период поиска, дней
-          <input name="lookback_days" type="number" min="1" max="3650" step="1" required>
-        </label>
-        <label>
-          Запуск каждые, часов
-          <input name="interval_hours" type="number" min="1" max="720" step="1" required>
-        </label>
-      </div>
-      <label class="checkbox">
-        <input name="enabled" type="checkbox"> Искать по расписанию
-      </label>
-      <label class="checkbox">
-        <input name="download_open_access" type="checkbox"> Скачивать открытые PDF
-      </label>
       <p id="editor-error" class="form-error" role="alert" hidden></p>
       <footer class="dialog-actions">
         <button type="button" class="button" data-close="library-dialog">Отмена</button>
@@ -147,6 +186,7 @@
       <a id="preview-pdf" class="button" target="_blank" rel="noopener" hidden>Локальный PDF ↗</a>
       <span id="preview-kind" class="badge"></span>
     </div>
+    <p id="preview-download" class="secondary" hidden></p>
     <p id="preview-status" class="secondary" role="status"></p>
     <pre id="preview-text" tabindex="0" aria-label="Текст статьи"></pre>
     <form id="attach-form" class="attach-form">

@@ -1,7 +1,7 @@
 services:
   scisearcher:
     build: .
-    image: scisearcher:local
+    image: "${SCISEARCHER_IMAGE:-scisearcher:local}"
     restart: unless-stopped
     ports:
       - "${SCISEARCHER_BIND:-127.0.0.1}:${SCISEARCHER_PORT:-8738}:8080"
@@ -12,6 +12,20 @@ services:
       CROSSREF_MAILTO: ${CROSSREF_MAILTO:-}
     volumes:
       - library-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import http.client
+          connection = http.client.HTTPConnection("127.0.0.1", 8080, timeout=3)
+          connection.request("GET", "/healthz")
+          raise SystemExit(connection.getresponse().status != 200)
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 volumes:
   library-data:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from copy import deepcopy
 from datetime import date
 from importlib import import_module
@@ -11,7 +12,7 @@ from xml.etree.ElementTree import ParseError
 from .net import get_bytes
 from .types import Candidate, Getter, SourceSpec
 
-__all__ = ["fetch", "get_bytes", "source_specs"]
+__all__ = ["fetch", "fetch_pages", "get_bytes", "source_specs"]
 
 # Trusted module names are selected here in code, never from library configuration.
 _BUILTIN_MODULES = (
@@ -52,4 +53,31 @@ def fetch(source: dict, keyword: str, since: date, limit: int, *, get: Getter | 
         rows = _REGISTRY[kind].search(source, keyword, since, limit, getter)
     except (ParseError, JSONDecodeError, UnicodeDecodeError) as error:
         raise ValueError(f"{kind}: источник вернул данные в неожиданном формате") from error
-    return [row for row in rows if row["title"]][:limit]
+    if not isinstance(rows, list):
+        raise ValueError("Адаптер должен вернуть список публикаций.")
+    return rows[:limit]
+
+
+def fetch_pages(source: dict, keyword: str, since: date, limit: int,
+                *, get: Getter | None = None) -> Iterator[list[Candidate]]:
+    """Read one source in pages. Adapters with only search still work."""
+    kind = source.get("kind")
+    if not isinstance(kind, str) or kind not in _REGISTRY:
+        raise ValueError("Неизвестный источник")
+    limit = max(1, min(int(limit), 1000))
+    module = _REGISTRY[kind]
+    if not hasattr(module, "pages"):
+        limit = min(limit, 100)
+        rows = fetch(source, keyword, since, limit, get=get)
+        yield rows
+        if len(rows) == limit and module.SPEC["mode"] == "search":
+            raise ValueError(f"Адаптер выдал первые {limit} результатов и не поддерживает следующие страницы.")
+        return
+    getter = get_bytes if get is None else get
+    try:
+        for rows in module.pages(source, keyword, since, limit, getter):
+            if not isinstance(rows, list) or len(rows) > limit:
+                raise ValueError(f"Адаптер должен вернуть список до {limit} публикаций на странице.")
+            yield rows
+    except (ParseError, JSONDecodeError, UnicodeDecodeError) as error:
+        raise ValueError(f"{kind}: источник вернул данные в неожиданном формате") from error
