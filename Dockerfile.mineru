@@ -1,0 +1,13 @@
+# MinerU parsing server for SciSearcher. Models are downloaded on first start into /models (a volume).
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 HOME=/models MINERU_TELEMETRY_DISABLED=1
+RUN pip install --no-cache-dir "mineru==4.2.3" \
+    && mkdir -p /models /tmp/mineru-upload \
+    && chown 10001:10001 /models /tmp/mineru-upload
+
+USER 10001:10001
+EXPOSE 8000
+# Shell form so that compose settings reach the flags: tier ceiling and parallel parses.
+CMD exec mineru-kit api-server --host 0.0.0.0 --port 8000 --tier "${MINERU_SERVER_TIER:-auto}" \
+    --concurrency "${PARSE_WORKERS:-1}" --upload-dir /tmp/mineru-upload --preload-models

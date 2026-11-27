@@ -43,7 +43,11 @@
           </div>
           <div class="action-row">
             <button id="edit-library" class="button" type="button">Настройки</button>
+            <button id="add-files" class="button" type="button">Добавить файлы</button>
+            <button id="add-folder" class="button" type="button">Добавить папку</button>
             <button id="run-library" class="button primary" type="button">Искать сейчас</button>
+            <input id="upload-files" type="file" multiple accept=".pdf,.djvu,.djv,.md,.markdown,.txt,.xml,.jats" hidden>
+            <input id="upload-folder" type="file" webkitdirectory hidden>
           </div>
         </header>
         <dl class="library-stats" aria-label="Состав библиотеки">
@@ -56,8 +60,12 @@
             <dd id="stat-full-text">—</dd>
           </div>
           <div class="stat">
-            <dt>Локальные PDF</dt>
+            <dt>Локальные файлы</dt>
             <dd id="stat-pdf">—</dd>
+          </div>
+          <div class="stat" id="stat-parse-box" hidden>
+            <dt>Ждут разбора</dt>
+            <dd id="stat-parse">—</dd>
           </div>
         </dl>
         <div class="run-strip">
@@ -92,7 +100,7 @@
               <legend class="sr-only">Показывать статьи с</legend>
               <label><input type="radio" name="scope" value="all" checked><span>Все</span></label>
               <label><input type="radio" name="scope" value="full_text"><span>С полным текстом</span></label>
-              <label><input type="radio" name="scope" value="pdf"><span>С PDF</span></label>
+              <label><input type="radio" name="scope" value="pdf"><span>С файлом</span></label>
             </fieldset>
           </div>
           <p id="results-message" class="secondary" role="status"></p>
@@ -123,7 +131,8 @@
           <div class="form-grid">
             <label>
               Ключевые слова и фразы
-              <textarea name="keywords" rows="3" required placeholder="По одной фразе в строке"></textarea>
+              <span class="secondary">Пусто — библиотека без поиска, файлы добавляются вручную</span>
+              <textarea name="keywords" rows="3" placeholder="По одной фразе в строке"></textarea>
             </label>
             <label>
               Исключить слова и фразы
@@ -183,7 +192,7 @@
     <p id="preview-meta" class="secondary"></p>
     <div class="action-row preview-actions">
       <a id="preview-link" class="button" target="_blank" rel="noopener noreferrer" hidden>У издателя ↗</a>
-      <a id="preview-pdf" class="button" target="_blank" rel="noopener" hidden>Локальный PDF ↗</a>
+      <a id="preview-pdf" class="button" target="_blank" rel="noopener" hidden>Локальный файл ↗</a>
       <span id="preview-kind" class="badge"></span>
     </div>
     <p id="preview-download" class="secondary" hidden></p>
@@ -192,8 +201,8 @@
     <form id="attach-form" class="attach-form">
       <label>
         Добавить файл статьи
-        <span class="secondary">PDF, Markdown, TXT или JATS XML</span>
-        <input id="attach-file" type="file" accept=".pdf,.md,.markdown,.txt,.xml,.jats" required>
+        <span class="secondary">PDF, DjVu, Markdown, TXT или JATS XML</span>
+        <input id="attach-file" type="file" accept=".pdf,.djvu,.djv,.md,.markdown,.txt,.xml,.jats" required>
       </label>
       <button id="attach-button" class="button primary" type="submit">Загрузить</button>
     </form>

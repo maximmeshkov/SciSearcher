@@ -12,6 +12,31 @@ const pdfProblemNames = {
   failed: "Ошибка загрузки PDF",
   no_text: "Текст из PDF не извлечён",
 };
+const parseNames = {
+  pending: "В очереди разбора",
+  parsing: "Разбирается",
+  failed: "Ошибка разбора",
+};
+const uploadFormats = {
+  pdf: "pdf", djvu: "djvu", djv: "djvu", md: "md", markdown: "md", txt: "txt", xml: "xml", jats: "xml",
+};
+
+function fileFormat(name) {
+  return uploadFormats[name.split(".").at(-1).toLowerCase()];
+}
+
+// One line about the PDF for the card and the preview: the parse queue wins over the download state.
+function pdfState(article) {
+  if (parseNames[article.parse_status]) {
+    return {
+      label: parseNames[article.parse_status],
+      detail: article.parse_status === "failed" ? article.parse_error || "" : "",
+      className: article.parse_status === "failed" ? "badge warning" : "badge active",
+    };
+  }
+  const label = pdfProblemNames[article.download_status];
+  return label ? { label, detail: article.download_error || "", className: "badge warning" } : null;
+}
 const runNames = {
   queued: "В очереди",
   running: "Идёт сбор",
@@ -96,6 +121,7 @@ function selected() {
 }
 
 function sourceLabel(kind) {
+  if (kind === "upload") return "Свой файл";
   return state.sourceTypes.find((type) => type.kind === kind)?.label || kind;
 }
 
@@ -176,13 +202,17 @@ function renderLibrary() {
   byId("workspace").hidden = !library;
   if (!library) {
     byId("welcome-create").hidden = false;
-    byId("welcome-message").textContent = "Создай библиотеку и задай для неё ключевые слова и источники.";
+    byId("welcome-message").textContent =
+      "Создай библиотеку: с поиском по источникам или для своих файлов.";
     return;
   }
   byId("library-name").textContent = library.name;
   const sources = [...new Set(library.sources.map((source) => sourceLabel(source.kind)))];
   const frequency = library.enabled ? "каждые " + library.interval_hours + " ч" : "ручной запуск";
-  byId("library-summary").textContent = sources.join(", ") + " · " + frequency;
+  byId("library-summary").textContent = sources.length ? sources.join(", ") + " · " + frequency
+    : "Без поиска · файлы добавляются вручную";
+  byId("run-library").hidden = !sources.length;
+  document.querySelector(".run-strip").hidden = !sources.length;
   byId("keywords").replaceChildren(...library.keywords.map((word) => make("span", "tag", word)));
   for (const [id, count] of [
     ["stat-articles", library.article_count],
@@ -191,6 +221,10 @@ function renderLibrary() {
   ]) {
     byId(id).textContent = Number.isInteger(count) ? numberFormat.format(count) : "—";
   }
+  const waiting = library.parse_waiting || 0;
+  const failed = library.parse_failed || 0;
+  byId("stat-parse-box").hidden = !(waiting || failed);
+  byId("stat-parse").textContent = numberFormat.format(waiting) + (failed ? " · ошибок " + numberFormat.format(failed) : "");
   const status = library.last_status;
   const runStatus = byId("run-status");
   runStatus.className = runClass(status);
@@ -245,14 +279,18 @@ function articleCard(article) {
     links.append(make("span", "secondary", article.sources.map(sourceLabel).join(", ")));
   }
   if (article.local_pdf) {
-    const pdf = make("a", "", "PDF ↗");
+    const pdf = make("a", "", "Файл ↗");
     pdf.href = articlePath(article.id) + "/pdf";
     pdf.target = "_blank";
     pdf.rel = "noopener";
     links.append(pdf);
   }
-  const pdfProblem = pdfProblemNames[article.download_status];
-  if (pdfProblem) links.append(make("span", "badge warning", pdfProblem));
+  const pdf = pdfState(article);
+  if (pdf) {
+    const badge = make("span", pdf.className, pdf.label);
+    if (pdf.detail) badge.title = pdf.detail;
+    links.append(badge);
+  }
   if (links.childElementCount) card.append(links);
   return card;
 }
@@ -291,8 +329,9 @@ async function loadArticles(indicate = false) {
     }
     const emptyMessage = state.search ? "По запросу ничего не найдено."
       : state.scope === "full_text" ? "В этой библиотеке пока нет извлечённых полных текстов."
-      : state.scope === "pdf" ? "В этой библиотеке пока нет локальных PDF."
-      : "Пока здесь нет статей. Запусти поиск по источникам.";
+      : state.scope === "pdf" ? "В этой библиотеке пока нет локальных файлов."
+      : selected()?.sources.length ? "Пока здесь нет статей. Запусти поиск по источникам."
+      : "Пока здесь нет файлов. Добавь их кнопкой «Добавить файлы» или «Добавить папку».";
     show(resultsMessage, items.length ? "" : emptyMessage, "secondary");
     byId("pagination").hidden = total <= limit;
     byId("previous-page").disabled = offset === 0;
@@ -434,22 +473,24 @@ async function saveLibrary(event) {
       (field) => [field.dataset.sourceField, field.value.trim()]).filter(([, value]) => value);
     return { ...Object.fromEntries(parameters), kind };
   });
+  const keywords = lines(fields.keywords);
   const payload = {
     name: fields.name.value.trim(),
-    keywords: lines(fields.keywords),
+    keywords,
     exclude: lines(fields.exclude),
     match: fields.match.value,
-    sources,
+    // Without phrases there is nothing to search: the library is filled by hand and keeps no sources.
+    sources: keywords.length ? sources : [],
     lookback_days: fields.all_history.checked ? 0 : Number(fields.lookback_days.value),
     interval_hours: Number(fields.interval_hours.value),
     enabled: fields.enabled.checked,
     download_open_access: fields.download_open_access.checked,
   };
-  if (!payload.name || !payload.keywords.length || !sources.length) {
-    show(errorMessage, "Укажи название, хотя бы одно ключевое слово и хотя бы один источник.");
+  if (!payload.name) {
+    show(errorMessage, "Укажи название библиотеки.");
     return;
   }
-  if (sources.some((source) => !state.sourceTypes.some((type) => type.kind === source.kind))) {
+  if (payload.sources.some((source) => !state.sourceTypes.some((type) => type.kind === source.kind))) {
     show(errorMessage, "Замени или убери недоступный источник.");
     return;
   }
@@ -549,9 +590,8 @@ function setPreviewFiles(article) {
   const kind = byId("preview-kind");
   kind.textContent = contentNames[article.content_kind] || article.content_kind;
   kind.className = article.content_kind === "full_text" ? "badge success" : "badge";
-  const pdfProblem = pdfProblemNames[article.download_status];
-  show(byId("preview-download"),
-    pdfProblem ? [pdfProblem, article.download_error].filter(Boolean).join(" · ") : "");
+  const pdfLine = pdfState(article);
+  show(byId("preview-download"), pdfLine ? [pdfLine.label, pdfLine.detail].filter(Boolean).join(" · ") : "");
 }
 
 async function loadText(article) {
@@ -592,11 +632,10 @@ async function attachFile(event) {
   const file = byId("attach-file").files[0];
   const article = state.article;
   if (!file || !article) return;
-  const formats = { pdf: "pdf", md: "md", markdown: "md", txt: "txt", xml: "xml", jats: "xml" };
-  const format = formats[file.name.split(".").at(-1).toLowerCase()];
+  const format = fileFormat(file.name);
   const status = byId("attach-status");
   if (!format) {
-    show(status, "Укажи PDF, Markdown, TXT или JATS XML.", "form-error");
+    show(status, "Укажи PDF, DjVu, Markdown, TXT или JATS XML.", "form-error");
     return;
   }
   byId("attach-button").disabled = true;
@@ -612,9 +651,12 @@ async function attachFile(event) {
       article.local_pdf = result.local_pdf;
       article.download_status = "downloaded";
       article.download_error = "";
+      article.parse_status = result.parse_status || null;
+      article.parse_error = "";
       setPreviewFiles(article);
       byId("attach-form").reset();
-      const message = result.content_kind === "full_text" ? "Полный текст добавлен."
+      const message = result.parse_status ? "Файл добавлен и поставлен в очередь разбора."
+        : result.content_kind === "full_text" ? "Полный текст добавлен."
         : "Файл добавлен. Извлечённый полный текст недоступен.";
       show(status, message, "secondary");
       void loadText(article);
@@ -626,6 +668,45 @@ async function attachFile(event) {
   } finally {
     if (article === state.article) byId("attach-button").disabled = false;
   }
+}
+
+// Send the chosen files to the library one by one; unsupported files (e.g. from a folder) are skipped.
+async function uploadFiles(input) {
+  const library = selected();
+  const chosen = Array.from(input.files);
+  input.value = "";
+  if (!library || !chosen.length) return;
+  const files = chosen.filter((file) => fileFormat(file.name));
+  const buttons = [byId("add-files"), byId("add-folder")];
+  for (const button of buttons) button.disabled = true;
+  let added = 0;
+  let repeated = 0;
+  const failed = [];
+  try {
+    for (const [index, file] of files.entries()) {
+      showNotice("Загрузка " + (index + 1) + " из " + files.length + ": " + file.name);
+      try {
+        const result = await api(libraryPath(library.id) + "/files?" + new URLSearchParams({ name: file.name }), {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: file,
+        });
+        if (result.duplicate) repeated += 1;
+        else added += 1;
+      } catch (error) {
+        failed.push(file.name + ": " + error.message);
+      }
+    }
+  } finally {
+    for (const button of buttons) button.disabled = false;
+  }
+  const report = ["Добавлено файлов: " + added];
+  if (repeated) report.push("уже были в библиотеке: " + repeated);
+  if (chosen.length > files.length) report.push("пропущено неподходящих: " + (chosen.length - files.length));
+  if (failed.length) report.push("ошибок: " + failed.length + " (" + failed.slice(0, 3).join("; ") + ")");
+  showNotice(report.join(" · "), failed.length > 0);
+  void refreshLibraries();
+  void loadArticles();
 }
 
 byId("libraries").addEventListener("click", (event) => {
@@ -642,6 +723,11 @@ libraryForm.elements.all_history.addEventListener("change", (event) => {
   libraryForm.elements.lookback_days.disabled = event.target.checked;
 });
 byId("run-library").addEventListener("click", runNow);
+byId("add-files").addEventListener("click", () => byId("upload-files").click());
+byId("add-folder").addEventListener("click", () => byId("upload-folder").click());
+for (const id of ["upload-files", "upload-folder"]) {
+  byId(id).addEventListener("change", (event) => void uploadFiles(event.target));
+}
 byId("full-text-only").addEventListener("change", updateExportLinks);
 byId("show-runs").addEventListener("click", () => {
   const list = byId("runs");

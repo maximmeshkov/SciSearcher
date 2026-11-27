@@ -6,15 +6,20 @@ import json
 import logging
 import os
 import re
+import shutil
+import sys
+import tempfile
 import threading
 import uuid
 from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from itertools import chain
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from catalog import Catalog, content_kind, normalize, normalize_doi
-from documents import MAX_UPLOAD_BYTES, chunks, extract
+from documents import chunks, djvu_to_pdf, extract, from_mineru, has_signature
+from mineru import MinerU
 from sources import fetch_pages, get_bytes, source_specs
 from sources.openalex import cached_pdf
 
@@ -22,6 +27,12 @@ from sources.openalex import cached_pdf
 STATIC = Path(__file__).resolve().parent / "static"
 PAGE_SIZE = 500
 DOWNLOAD_LIMIT = 40
+# Only downloads from the internet are limited: a server must not be able to fill the disk.
+MAX_DOWNLOAD_BYTES = int(os.environ.get("MAX_DOWNLOAD_MB", "200")) * 1024 * 1024
+PARSED_FORMATS = ("pdf", "djvu")  # the article's own document; MinerU turns it into text
+UPLOAD_FORMATS = {"pdf": "pdf", "djvu": "djvu", "djv": "djvu", "xml": "xml", "jats": "xml",
+                  "md": "md", "markdown": "md", "txt": "txt"}
+PICTURE_TYPES = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}
 
 
 def web_url(value):
@@ -63,11 +74,14 @@ def library_config(data):
     name = text_field(data, "name", 120)
     keywords = phrases(data, "keywords")
     match = data.get("match", "any")
-    if not name or not keywords or match not in ("any", "all"):
-        raise ValueError("Укажите название, хотя бы одну ключевую фразу и правило совпадения.")
-    supplied_sources = data.get("sources")
-    if not isinstance(supplied_sources, list) or not 1 <= len(supplied_sources) <= 20:
-        raise ValueError("Добавьте от 1 до 20 источников.")
+    if not name or match not in ("any", "all"):
+        raise ValueError("Укажите название и правило совпадения.")
+    # No sources: the library is filled by hand. A source searches by the phrases, so it needs one.
+    supplied_sources = data.get("sources", [])
+    if not isinstance(supplied_sources, list) or len(supplied_sources) > 20:
+        raise ValueError("Добавьте не больше 20 источников.")
+    if supplied_sources and not keywords:
+        raise ValueError("Для поиска по источникам нужна хотя бы одна ключевая фраза.")
     sources = []
     specs = {spec["kind"]: spec for spec in source_specs()}
     for item in supplied_sources:
@@ -155,13 +169,59 @@ def standardized(paper, source):
     return result
 
 
+def uploaded_record(file_name, digest):
+    """Catalog record for a file added by hand: the file name is the title, the content digest its key,
+    so the same file added again, even renamed, finds the same record."""
+    title = Path(file_name.replace("\\", "/")).stem.strip()[:2000] or "Без названия"
+    return {"title": title, "doi": "", "abstract": "", "authors": [], "venue": "", "published": "",
+            "url": "", "pdf_url": "", "license": "", "external_id": digest, "source": "upload", "origin": "upload"}
+
+
 class Indexer:
-    def __init__(self, catalog, *, search=fetch_pages, download=get_bytes):
+    def __init__(self, catalog, *, search=fetch_pages, download=get_bytes, parser=None):
         self.catalog = catalog
         self.search = search
         self.download = download
+        self.parser = parser  # MinerU client; None keeps the pypdf text path
         self.wake = threading.Event()
+        self.parse_wake = threading.Event()
         self.stop = threading.Event()
+
+    def parse_next(self):
+        """Parse one queued PDF or DjVu file with MinerU.
+
+        Returns False when nothing is due or MinerU is unreachable.
+        """
+        item = self.catalog.next_parse()
+        if item is None:
+            return False
+        article_id, format_name, digest = item
+        source = self.catalog.files.path(digest)
+        try:
+            with tempfile.TemporaryDirectory() as work:
+                pdf = source if format_name == "pdf" else djvu_to_pdf(source, Path(work) / "pages.pdf")
+                prepared = from_mineru(*self.parser.parse(pdf, f"article-{article_id}.pdf"))
+        except ConnectionError as error:
+            logging.warning("%s Статья %s вернётся в очередь.", error, article_id)
+            self.catalog.queue_parse(article_id)
+            return False
+        except Exception as error:
+            logging.warning("Разбор статьи %s не удался: %s", article_id, error)
+            self.catalog.parse_failed(article_id, str(error)[:300])
+            return True
+        self.catalog.save_parsed(article_id, prepared)
+        return True
+
+    def parse_loop(self):
+        """Worker thread: parse queued PDFs one at a time while the service runs."""
+        while not self.stop.is_set():
+            self.parse_wake.clear()
+            try:
+                if self.parse_next():
+                    continue
+            except Exception:
+                logging.exception("Сбой очереди разбора")
+            self.parse_wake.wait(30)
 
     def fetch_pdf(self, article):
         def check_pdf(raw):
@@ -170,7 +230,7 @@ class Indexer:
             return raw
 
         try:
-            return check_pdf(self.download(article["pdf_url"], MAX_UPLOAD_BYTES, accept="application/pdf"))
+            return check_pdf(self.download(article["pdf_url"], MAX_DOWNLOAD_BYTES, accept="application/pdf"))
         except Exception as direct_error:
             if not os.getenv("OPENALEX_API_KEY"):
                 raise
@@ -178,7 +238,7 @@ class Indexer:
             if not external_id:
                 raise
             try:
-                raw = cached_pdf(external_id, MAX_UPLOAD_BYTES, self.download)
+                raw = cached_pdf(external_id, MAX_DOWNLOAD_BYTES, self.download)
                 if raw is not None:
                     return check_pdf(raw)
             except Exception as cache_error:
@@ -256,6 +316,14 @@ class Indexer:
                         self.catalog.download_failed(doc["id"], str(error)[:300])
                         errors.append(f"Статья {doc['id']} — загрузка PDF: {str(error)[:200]}")
                         continue
+                    digest = self.catalog.files.save([raw])
+                    if self.parser:
+                        stored = self.catalog.attach(doc["id"], "pdf", digest, "", only_missing=True)
+                        if stored:
+                            self.catalog.queue_parse(doc["id"])
+                            self.parse_wake.set()
+                        downloaded += int(stored)
+                        continue
                     problem = ""
                     try:
                         text, _ = extract(raw, "pdf")
@@ -263,8 +331,10 @@ class Indexer:
                         text = ""
                         problem = str(error)
                         errors.append(f"Статья {doc['id']} — {problem}")
-                    downloaded += int(self.catalog.attach(doc["id"], "pdf", raw, text, only_missing=True, error=problem))
-            status = ("partial" if errors else "ok") if successful_queries else "error"
+                    downloaded += int(self.catalog.attach(doc["id"], "pdf", digest, text, only_missing=True,
+                                                          error=problem))
+            # A library without sources has nothing to search, and that is not an error.
+            status = ("partial" if errors else "ok") if successful_queries or not cfg["sources"] else "error"
         except Exception as error:
             logging.exception("Сбой обработки библиотеки %s", run["library_id"])
             errors.append(f"Обработка прервана: {str(error)[:300]}")
@@ -317,6 +387,12 @@ class Api(BaseHTTPRequestHandler):
     def send_json(self, data, status=200):
         self.send_bytes(status, "application/json; charset=utf-8", json.dumps(data, ensure_ascii=False).encode())
 
+    def send_file(self, path, mime, filename=None):
+        """Stream a stored file from disk."""
+        with path.open("rb") as source:
+            self.headers_for(200, mime, length=path.stat().st_size, filename=filename)
+            shutil.copyfileobj(source, self.wfile)
+
     def authorize(self, method):
         host = self.headers.get("Host", "")
         if self.server.password:
@@ -347,6 +423,71 @@ class Api(BaseHTTPRequestHandler):
         if len(data) != length:
             raise HttpError(400, "Тело запроса получено не полностью.")
         return data
+
+    def request_chunks(self):
+        """The request body in 1 MiB pieces, so a file of any size passes without filling memory."""
+        if self.headers.get("Transfer-Encoding"):
+            raise HttpError(400, "Нужна загрузка с известным размером.")
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0:
+            raise HttpError(400, "Файл пуст.")
+
+        def pieces(left):
+            while left:
+                piece = self.rfile.read(min(left, 1 << 20))
+                if not piece:
+                    raise HttpError(400, "Тело запроса получено не полностью.")
+                left -= len(piece)
+                yield piece
+
+        return pieces(length)
+
+    def receive_file(self, format_name):
+        """Check the uploaded file's signature on its first piece and stream it into the file store."""
+        if format_name == "djvu" and not self.server.indexer.parser:
+            raise HttpError(422, "DjVu разбирается только через MinerU: задайте MINERU_URL.")
+        body = self.request_chunks()
+        first = next(body)
+        if not has_signature(format_name, first):
+            raise HttpError(422, f"Файл не распознан как {format_name.upper()}.")
+        return self.server.indexer.catalog.files.save(chain([first], body))
+
+    def extract_text(self, format_name, digest):
+        """Text of a received file; empty for PDF and DjVu that MinerU will parse."""
+        if format_name in PARSED_FORMATS and self.server.indexer.parser:
+            return ""
+        try:
+            return extract(self.server.indexer.catalog.files.path(digest).read_bytes(), format_name)[0]
+        except ValueError as error:
+            raise HttpError(422, str(error)) from error
+
+    def store_file(self, article, format_name, digest, text):
+        """Attach a received file to the article and queue it for MinerU when it has no text yet."""
+        indexer = self.server.indexer
+        catalog = indexer.catalog
+        if not catalog.attach(article["id"], format_name, digest, text):
+            raise HttpError(404, "Запись больше не существует. Обновите библиотеку и повторите загрузку.")
+        local = format_name in PARSED_FORMATS or any(catalog.attachment(article["id"], kind) for kind in PARSED_FORMATS)
+        if text:
+            return {"content_kind": "full_text", "local_pdf": local}
+        catalog.queue_parse(article["id"])
+        indexer.parse_wake.set()
+        return {"content_kind": content_kind("", article["abstract"]), "local_pdf": True, "parse_status": "pending"}
+
+    def add_library_file(self, library_id, query):
+        """Add one file to a library as its own record; the same file again is reported as a duplicate."""
+        catalog = self.server.indexer.catalog
+        name = query.get("name", [""])[0][:300]
+        format_name = UPLOAD_FORMATS.get(Path(name).suffix.lower().lstrip("."))
+        if not format_name:
+            raise HttpError(415, "Поддерживаются PDF, DjVu, XML, Markdown и TXT.")
+        digest = self.receive_file(format_name)
+        text = self.extract_text(format_name, digest)
+        article_id, added = catalog.add_article(library_id, uploaded_record(name, digest))
+        result = {"id": article_id, "duplicate": not added}
+        if catalog.attachment(article_id, format_name) == digest:
+            return result  # already stored and parsed or queued: a repeated upload costs nothing
+        return result | self.store_file(catalog.article(article_id), format_name, digest, text)
 
     def request_json(self):
         if self.headers.get_content_type() != "application/json":
@@ -400,7 +541,15 @@ class Api(BaseHTTPRequestHandler):
         if method == "GET" and path == "/api/sources":
             self.send_json(source_specs())
             return
-        match = re.fullmatch(r"/api/libraries/([1-9]\d{0,9})(?:/(run|runs|articles|export\.md|export\.jsonl))?", path)
+        match = re.fullmatch(r"/api/files/([0-9a-f]{64})\.(jpg|jpeg|png)", path)
+        if method == "GET" and match:
+            picture = catalog.files.path(match[1])
+            if not picture.is_file():
+                raise HttpError(404, "Файл не найден.")
+            self.send_file(picture, PICTURE_TYPES[match[2]])
+            return
+        match = re.fullmatch(r"/api/libraries/([1-9]\d{0,9})(?:/(run|runs|articles|files|export\.md|export\.jsonl))?",
+                             path)
         if match:
             library_id = int(match[1])
             rows = catalog.libraries(library_id)
@@ -418,6 +567,9 @@ class Api(BaseHTTPRequestHandler):
                 return
             if method == "GET" and match[2] == "runs":
                 self.send_json(catalog.runs(library_id))
+                return
+            if method == "POST" and match[2] == "files":
+                self.send_json(self.add_library_file(library_id, query), 201)
                 return
             if method == "GET" and match[2] == "articles":
                 offset = max(0, min(10**8, int(query.get("offset", [0])[0])))
@@ -446,25 +598,18 @@ class Api(BaseHTTPRequestHandler):
                             "content_kind": content_kind(article["body"], article["abstract"])})
             return
         if method == "GET" and action == "pdf":
-            file = catalog.attachment(article_id, "pdf")
-            if file is None:
-                raise HttpError(404, "В библиотеке нет PDF этой статьи.")
-            self.headers_for(200, "application/pdf", length=len(file), filename=f"article-{article_id}.pdf")
-            self.wfile.write(file)
-            return
+            for format_name, mime in (("pdf", "application/pdf"), ("djvu", "image/vnd.djvu")):
+                digest = catalog.attachment(article_id, format_name)
+                if digest:
+                    self.send_file(catalog.files.path(digest), mime, f"article-{article_id}.{format_name}")
+                    return
+            raise HttpError(404, "В библиотеке нет файла этой статьи.")
         if method == "PUT" and action == "file":
             format_name = query.get("format", [""])[0]
-            if format_name not in ("pdf", "xml", "md", "txt"):
-                raise HttpError(415, "Поддерживаются PDF, XML, Markdown и TXT.")
-            raw = self.request_body(MAX_UPLOAD_BYTES)
-            try:
-                text, _ = extract(raw, format_name)
-            except ValueError as error:
-                raise HttpError(422, str(error)) from error
-            if not catalog.attach(article_id, format_name, raw, text):
-                raise HttpError(404, "Запись больше не существует. Обновите библиотеку и повторите загрузку.")
-            self.send_json({"content_kind": "full_text", "local_pdf": format_name == "pdf" or
-                            catalog.attachment(article_id, "pdf") is not None})
+            if format_name not in set(UPLOAD_FORMATS.values()):
+                raise HttpError(415, "Поддерживаются PDF, DjVu, XML, Markdown и TXT.")
+            digest = self.receive_file(format_name)
+            self.send_json(self.store_file(article, format_name, digest, self.extract_text(format_name, digest)))
             return
         raise HttpError(404, "Действие не найдено.")
 
@@ -507,17 +652,35 @@ def make_server(host, port, indexer, password="", *, worker=None):
 
 
 def main():
+    # Windows uses the ANSI code page for redirected output; Russian messages need UTF-8.
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8")
     args = argparse.ArgumentParser(description="Локальный индексер научной литературы")
     args.add_argument("--host", default=os.environ.get("INDEXER_HOST", "127.0.0.1"))
     args.add_argument("--port", type=int, default=int(os.environ.get("INDEXER_PORT", "8080")))
     args.add_argument("--data", type=Path, default=Path(os.environ.get("INDEXER_DATA_DIR", "data")))
     config = args.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-    indexer = Indexer(Catalog(config.data / "catalog.sqlite3"))
+    password = os.environ.get("INDEXER_PASSWORD", "")
+    if not password and config.host not in ("127.0.0.1", "localhost", "::1"):
+        logging.warning("INDEXER_PASSWORD не задан, а сервис слушает %s. Проверка заголовка Host не защищает "
+                        "от клиентов в сети: они могут прислать Host: localhost.", config.host)
+    mineru_url = os.environ.get("MINERU_URL", "")
+    timeout = float(os.environ.get("MINERU_TIMEOUT_HOURS", "48")) * 3600
+    parser = MinerU(mineru_url, os.environ.get("MINERU_API_KEY", ""), os.environ.get("MINERU_TIER", ""),
+                    timeout_seconds=timeout) if mineru_url else None
+    indexer = Indexer(Catalog(config.data / "catalog.sqlite3"), parser=parser)
     worker = threading.Thread(target=indexer.supervise, daemon=True)
-    server = make_server(config.host, config.port, indexer, os.environ.get("INDEXER_PASSWORD", ""), worker=worker)
+    server = make_server(config.host, config.port, indexer, password, worker=worker)
     worker.start()
-    print(f"Индексер слушает http://{server.server_name}:{server.server_port}", flush=True)
+    if parser:
+        queued = indexer.catalog.queue_unparsed_pdfs()
+        workers = max(1, int(os.environ.get("PARSE_WORKERS", "1")))
+        for _ in range(workers):
+            threading.Thread(target=indexer.parse_loop, daemon=True).start()
+        logging.info("PDF разбирает MinerU: %s, параллельно %s, поставлено в очередь %s", mineru_url, workers, queued)
+    # The bind address, not server_name: a reverse-DNS name (e.g. kubernetes.docker.internal) fails the Host check.
+    print(f"Индексер слушает http://{config.host}:{server.server_port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -525,6 +688,7 @@ def main():
     finally:
         indexer.stop.set()
         indexer.wake.set()
+        indexer.parse_wake.set()
         server.server_close()
 
 

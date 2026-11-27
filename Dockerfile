@@ -3,10 +3,14 @@ FROM python:3.14-slim
 WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 INDEXER_HOST=0.0.0.0 INDEXER_DATA_DIR=/data
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
+# djvulibre-bin provides ddjvu, which renders DjVu pages to PDF for MinerU.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends djvulibre-bin \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir -r requirements.txt \
     && mkdir /data \
     && chown 10001:10001 /data
-COPY app.py catalog.py documents.py ./
+COPY app.py catalog.py documents.py files.py mineru.py ./
 COPY sources ./sources
 COPY static ./static
 

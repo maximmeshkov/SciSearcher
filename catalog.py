@@ -9,6 +9,8 @@ from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote, urlsplit, urlunsplit
 
+from files import FileStore
+
 
 def now():
     return datetime.now(timezone.utc).isoformat()
@@ -100,8 +102,19 @@ CREATE TABLE IF NOT EXISTS memberships (
 CREATE TABLE IF NOT EXISTS attachments (
     article_id INTEGER NOT NULL REFERENCES articles(id),
     format TEXT NOT NULL,
-    data BLOB NOT NULL,
+    digest TEXT NOT NULL,
     PRIMARY KEY (article_id, format)
+);
+CREATE TABLE IF NOT EXISTS parse_queue (
+    article_id INTEGER PRIMARY KEY REFERENCES articles(id),
+    status TEXT NOT NULL,
+    error TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    retry_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS article_references (
+    article_id INTEGER PRIMARY KEY REFERENCES articles(id),
+    text TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY,
@@ -120,12 +133,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS runs_active_library ON runs (library_id)
 """
 
 
+# Formats of the article's own document file: MinerU turns them into text.
+LOCAL_FILE = "f.format IN ('pdf', 'djvu')"
+
+
 class Catalog:
-    def __init__(self, path):
+    def __init__(self, path, files=None):
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.files = files or FileStore(path.parent / "files")
         with self.connection() as db:
             db.execute("PRAGMA journal_mode = WAL")
+            if "data" in {row[1] for row in db.execute("PRAGMA table_info(attachments)")}:
+                # Older versions kept files inside the database; _move_blobs_to_files takes them out.
+                db.execute("ALTER TABLE attachments RENAME TO attachments_blob")
             db.executescript(SCHEMA)
             db.execute("INSERT OR IGNORE INTO catalog_metadata VALUES ('identity', ?)", (str(uuid.uuid4()),))
             self.identity = db.execute("SELECT value FROM catalog_metadata WHERE key = 'identity'").fetchone()[0]
@@ -133,6 +154,17 @@ class Catalog:
             db.execute("""INSERT OR IGNORE INTO catalog_metadata
                 SELECT 'last_article_id', COALESCE(MAX(id), 0) FROM articles""")
             db.execute("UPDATE runs SET status = 'queued' WHERE status = 'running'")
+        self._move_blobs_to_files()
+
+    def _move_blobs_to_files(self):
+        """One-time move of files that older versions kept inside the database into the file store."""
+        with self.connection(write=True) as db:
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE name = 'attachments_blob'").fetchone():
+                return
+            for article_id, format_name, data in db.execute("SELECT article_id, format, data FROM attachments_blob"):
+                db.execute("INSERT OR REPLACE INTO attachments VALUES (?, ?, ?)",
+                           (article_id, format_name, self.files.save([data])))
+            db.execute("DROP TABLE attachments_blob")
 
     @contextmanager
     def connection(self, *, write=False):
@@ -157,12 +189,16 @@ class Catalog:
         return True
 
     def libraries(self, library_id=None):
-        query = """SELECT l.*,
+        query = f"""SELECT l.*,
             (SELECT COUNT(*) FROM memberships m WHERE m.library_id = l.id) AS article_count,
             (SELECT COUNT(*) FROM memberships m JOIN articles a ON a.id = m.article_id
                 WHERE m.library_id = l.id AND a.body <> '') AS full_text_count,
-            (SELECT COUNT(*) FROM memberships m JOIN attachments f ON f.article_id = m.article_id
-                WHERE m.library_id = l.id AND f.format = 'pdf') AS pdf_count,
+            (SELECT COUNT(DISTINCT m.article_id) FROM memberships m JOIN attachments f ON f.article_id = m.article_id
+                WHERE m.library_id = l.id AND {LOCAL_FILE}) AS pdf_count,
+            (SELECT COUNT(*) FROM memberships m JOIN parse_queue q ON q.article_id = m.article_id
+                WHERE m.library_id = l.id AND q.status <> 'failed') AS parse_waiting,
+            (SELECT COUNT(*) FROM memberships m JOIN parse_queue q ON q.article_id = m.article_id
+                WHERE m.library_id = l.id AND q.status = 'failed') AS parse_failed,
             (SELECT started_at FROM runs r WHERE r.library_id = l.id ORDER BY id DESC LIMIT 1) AS last_run_at,
             (SELECT status FROM runs r WHERE r.library_id = l.id ORDER BY id DESC LIMIT 1) AS last_status
             FROM libraries l"""
@@ -172,12 +208,15 @@ class Catalog:
             params = (library_id,)
         with self.connection() as db:
             return [json.loads(row["config"]) | {
-                key: row[key] for key in ("id", "article_count", "full_text_count", "pdf_count", "last_run_at", "last_status")
+                key: row[key] for key in ("id", "article_count", "full_text_count", "pdf_count", "parse_waiting",
+                                          "parse_failed", "last_run_at", "last_status")
             } for row in db.execute(query + " ORDER BY l.id", params)]
 
     def save_library(self, config, library_id=None):
+        # A library without sources is filled by hand: the scheduler has nothing to run for it.
+        scheduled = config["enabled"] and bool(config.get("sources"))
         with self.connection(write=True) as db:
-            values = (json.dumps(config, ensure_ascii=False), config["enabled"], now())
+            values = (json.dumps(config, ensure_ascii=False), scheduled, now())
             if library_id is None:
                 library_id = db.execute(
                     "INSERT INTO libraries (config, enabled, due_at) VALUES (?, ?, ?)", values
@@ -241,7 +280,7 @@ class Catalog:
                 placeholders = ", ".join("?" for _ in ids)
                 conflict = db.execute(f"""SELECT b.article_id FROM attachments a JOIN attachments b
                     ON b.format = a.format WHERE a.article_id = ? AND b.article_id IN ({placeholders})
-                    AND a.data <> b.data LIMIT 1""", (hit["id"], *ids)).fetchone()
+                    AND a.digest <> b.digest LIMIT 1""", (hit["id"], *ids)).fetchone()
                 if conflict:
                     # One file per format is addressable. Keep both originals on conflict.
                     logging.warning("Different attachments prevent merging articles %s and %s", hit["id"], conflict[0])
@@ -267,10 +306,14 @@ class Catalog:
             db.execute("""INSERT OR IGNORE INTO memberships
                 SELECT library_id, ? FROM memberships WHERE article_id = ?""", (winner_id, duplicate_id))
             db.execute("""INSERT OR IGNORE INTO attachments
-                SELECT ?, format, data FROM attachments WHERE article_id = ?""", (winner_id, duplicate_id))
+                SELECT ?, format, digest FROM attachments WHERE article_id = ?""", (winner_id, duplicate_id))
+            for table in ("parse_queue", "article_references"):
+                db.execute(f"UPDATE OR IGNORE {table} SET article_id = ? WHERE article_id = ?", (winner_id, duplicate_id))
             db.execute("DELETE FROM article_sources WHERE article_id = ?", (duplicate_id,))
             db.execute("DELETE FROM memberships WHERE article_id = ?", (duplicate_id,))
             db.execute("DELETE FROM attachments WHERE article_id = ?", (duplicate_id,))
+            db.execute("DELETE FROM parse_queue WHERE article_id = ?", (duplicate_id,))
+            db.execute("DELETE FROM article_references WHERE article_id = ?", (duplicate_id,))
             db.execute("DELETE FROM articles WHERE id = ?", (duplicate_id,))
 
         state = max(matches, key=lambda row: (bool(row["body"]), row["download_status"] == "pending",
@@ -341,20 +384,79 @@ class Catalog:
                 retry_at = ?, download_attempts = download_attempts + 1 WHERE id = ? AND body = ''""",
                 (reason, next_try, article_id))
 
-    def attach(self, article_id, format_name, data, text, *, only_missing=False, error=""):
+    def attach(self, article_id, format_name, digest, text, *, only_missing=False, error=""):
+        """Link a stored file (by digest) to the article and set the article text from it."""
         with self.connection(write=True) as db:
             row = db.execute("SELECT body FROM articles WHERE id = ?", (article_id,)).fetchone()
             if not row or (only_missing and row[0]):
                 return False
-            db.execute("INSERT OR REPLACE INTO attachments VALUES (?, ?, ?)", (article_id, format_name, data))
+            db.execute("INSERT OR REPLACE INTO attachments VALUES (?, ?, ?)", (article_id, format_name, digest))
             status = "downloaded" if text else "no_text"
             db.execute("""UPDATE articles SET body = ?, body_format = ?, download_status = ?,
                 download_error = ?, retry_at = '' WHERE id = ?""", (text, format_name, status, error, article_id))
         return True
 
+    def queue_parse(self, article_id):
+        """Put the article's PDF in the parse queue; a new copy starts the attempts over."""
+        with self.connection(write=True) as db:
+            db.execute("""INSERT INTO parse_queue (article_id, status, retry_at) VALUES (?, 'pending', ?)
+                ON CONFLICT (article_id) DO UPDATE SET status = 'pending', error = '', attempts = 0,
+                retry_at = excluded.retry_at""", (article_id, now()))
+
+    def queue_unparsed_pdfs(self):
+        """Queue stored PDF and DjVu files whose text did not come from MinerU and resume interrupted parses."""
+        with self.connection(write=True) as db:
+            db.execute("UPDATE parse_queue SET status = 'pending' WHERE status = 'parsing'")
+            return db.execute(f"""INSERT OR IGNORE INTO parse_queue (article_id, status, retry_at)
+                SELECT DISTINCT f.article_id, 'pending', ? FROM attachments f JOIN articles a ON a.id = f.article_id
+                WHERE {LOCAL_FILE} AND a.body_format NOT IN ('mineru', 'xml', 'md', 'txt')""",
+                              (now(),)).rowcount
+
+    def next_parse(self):
+        """Take the oldest due article from the parse queue: (article_id, format, digest) or None.
+
+        An article with both a PDF and a DjVu file is parsed from the PDF.
+        """
+        with self.connection(write=True) as db:
+            row = db.execute(f"""SELECT q.article_id, f.format, f.digest FROM parse_queue q JOIN attachments f
+                ON f.article_id = q.article_id AND {LOCAL_FILE}
+                WHERE q.status IN ('pending', 'failed') AND q.retry_at <= ?
+                ORDER BY q.retry_at, q.article_id, f.format DESC LIMIT 1""", (now(),)).fetchone()
+            if row:
+                db.execute("UPDATE parse_queue SET status = 'parsing' WHERE article_id = ?", (row[0],))
+        return tuple(row) if row else None
+
+    def save_parsed(self, article_id, prepared):
+        """Store prepared text and references and take the article off the parse queue.
+
+        Text the user supplied as XML, Markdown or TXT is kept: it is better than a PDF parse.
+        Pictures the text links to go to the file store first, so a stored link never points nowhere.
+        """
+        for picture in prepared.figures.values():
+            self.files.save([picture])
+        with self.connection(write=True) as db:
+            db.execute("""UPDATE articles SET body = ?, body_format = 'mineru', download_status = 'downloaded',
+                download_error = '', retry_at = '' WHERE id = ? AND body_format NOT IN ('xml', 'md', 'txt')""",
+                       (prepared.body, article_id))
+            if db.execute("SELECT 1 FROM articles WHERE id = ?", (article_id,)).fetchone():
+                db.execute("INSERT OR REPLACE INTO article_references VALUES (?, ?)", (article_id, prepared.references))
+            db.execute("DELETE FROM parse_queue WHERE article_id = ?", (article_id,))
+
+    def parse_failed(self, article_id, reason):
+        """Keep the article in the parse queue and retry later with a growing pause."""
+        with self.connection(write=True) as db:
+            row = db.execute("SELECT attempts FROM parse_queue WHERE article_id = ?", (article_id,)).fetchone()
+            if row is None:
+                return
+            delay = min(24 * 7, 2 ** min(row[0], 8))
+            next_try = (datetime.now(timezone.utc) + timedelta(hours=delay)).isoformat()
+            db.execute("""UPDATE parse_queue SET status = 'failed', error = ?, retry_at = ?,
+                attempts = attempts + 1 WHERE article_id = ?""", (reason, next_try, article_id))
+
     def attachment(self, article_id, format_name):
+        """Digest of the article's file in this format, or None."""
         with self.connection() as db:
-            row = db.execute("SELECT data FROM attachments WHERE article_id = ? AND format = ?",
+            row = db.execute("SELECT digest FROM attachments WHERE article_id = ? AND format = ?",
                              (article_id, format_name)).fetchone()
             return row[0] if row else None
 
@@ -371,19 +473,21 @@ class Catalog:
         return row["key"][len(prefix):] if row else ""
 
     def articles(self, library_id, search, limit, offset, *, scope="all"):
-        conditions = " FROM memberships m JOIN articles a ON a.id = m.article_id WHERE m.library_id = ?"
+        conditions = (" FROM memberships m JOIN articles a ON a.id = m.article_id"
+                      " LEFT JOIN parse_queue q ON q.article_id = a.id WHERE m.library_id = ?")
         params = [library_id]
         if scope == "full_text":
             conditions += " AND a.body <> ''"
         elif scope == "pdf":
-            conditions += " AND EXISTS(SELECT 1 FROM attachments f WHERE f.article_id = a.id AND f.format = 'pdf')"
+            conditions += f" AND EXISTS(SELECT 1 FROM attachments f WHERE f.article_id = a.id AND {LOCAL_FILE})"
         if search:
             conditions += " AND instr(a.search_text, ?) > 0"
             params.append(normalize(search))
-        query = """SELECT a.id, a.title, a.doi, a.abstract, a.authors, a.venue, a.published,
+        query = f"""SELECT a.id, a.title, a.doi, a.abstract, a.authors, a.venue, a.published,
             a.url, a.license, a.download_status, a.download_error, length(a.body) > 0 AS full_text,
-            EXISTS(SELECT 1 FROM attachments f WHERE f.article_id = a.id AND f.format = 'pdf') AS local_pdf,
-            (SELECT group_concat(DISTINCT s.source) FROM article_sources s WHERE s.article_id = a.id) AS sources"""
+            EXISTS(SELECT 1 FROM attachments f WHERE f.article_id = a.id AND {LOCAL_FILE}) AS local_pdf,
+            (SELECT group_concat(DISTINCT s.source) FROM article_sources s WHERE s.article_id = a.id) AS sources,
+            q.status AS parse_status, q.error AS parse_error"""
         with self.connection() as db:
             total = db.execute("SELECT COUNT(*)" + conditions, params).fetchone()[0]
             rows = db.execute(query + conditions + " ORDER BY a.published DESC, a.id DESC LIMIT ? OFFSET ?",

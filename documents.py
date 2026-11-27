@@ -1,13 +1,16 @@
 """Extract searchable text without changing the original article file."""
 
 from collections.abc import Iterator
+from dataclasses import dataclass, field
+import hashlib
 from io import BytesIO
+from pathlib import PurePosixPath
 import re
+import subprocess
 from xml.etree import ElementTree as ET
 
 
-MAX_UPLOAD_BYTES = 32 * 1024 * 1024
-MAX_TEXT_CHARS = 2_000_000
+# Limits of the pypdf fallback, used only when MinerU is off.
 MAX_PDF_PAGES = 500
 MAX_PDF_PAGE_STREAM_BYTES = 8 * 1024 * 1024
 MAX_XML_ELEMENTS = 150_000
@@ -15,6 +18,8 @@ MAX_XML_DEPTH = 80
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f]")
 _PAGE_MARKER = re.compile(r"^## Страница ([1-9][0-9]{0,5})[ \t]*$")
+# Page marker of prepared text: invisible in rendered Markdown and keeps section headings across pages.
+_PAGE_COMMENT = re.compile(r"^<!-- page: ([1-9][0-9]{0,5}) -->$")
 _HEADING = re.compile(r"^(#{1,6})[ \t]+(.+)$")
 _FENCE = re.compile(r"^[ ]{0,3}(\x60{3,}|~{3,})")
 _SECTIONS = frozenset({"sec", "div", "div1", "div2", "div3", "div4", "div5", "div6", "div7"})
@@ -50,7 +55,6 @@ def _extract_pdf(data: bytes) -> tuple[str, int]:
         if page_count > MAX_PDF_PAGES:
             raise ValueError(f"В PDF больше {MAX_PDF_PAGES} страниц.")
         sections = []
-        total_chars = 0
         for page_number, page in enumerate(reader.pages, start=1):
             contents = page.get_contents()
             if contents is None:
@@ -59,11 +63,7 @@ def _extract_pdf(data: bytes) -> tuple[str, int]:
                 raise ValueError(f"Слишком большой поток содержимого PDF на странице {page_number}.")
             text = _clean_text(page.extract_text() or "")
             if _has_text(text):
-                section = f"## Страница {page_number}\n\n{text}"
-                total_chars += len(section) + 2
-                if total_chars > MAX_TEXT_CHARS:
-                    raise ValueError("Извлечённый текст PDF превышает допустимый размер.")
-                sections.append(section)
+                sections.append(f"## Страница {page_number}\n\n{text}")
     except ValueError:
         raise
     except Exception as exc:
@@ -230,8 +230,8 @@ def _extract_xml(data: bytes) -> str:
 
 def extract(data: bytes, format: str) -> tuple[str, int]:
     """Return text and the original PDF page count (zero for other formats)."""
-    if not data or len(data) > MAX_UPLOAD_BYTES:
-        raise ValueError("Файл пуст или больше 32 МиБ.")
+    if not data:
+        raise ValueError("Файл пуст.")
     kind = format.casefold().lstrip(".")
     if kind == "pdf":
         return _extract_pdf(data)
@@ -246,9 +246,111 @@ def extract(data: bytes, format: str) -> tuple[str, int]:
             raise ValueError("В файле нет читаемого текста.")
     else:
         raise ValueError("Поддерживаются PDF, XML (JATS/TEI), Markdown и TXT.")
-    if len(text) > MAX_TEXT_CHARS:
-        raise ValueError("Извлечённый текст превышает допустимый размер.")
     return text, 0
+
+
+def has_signature(format_name: str, head: bytes) -> bool:
+    """Whether the first bytes of a file match its format; text formats have no signature."""
+    if format_name == "pdf":
+        return b"%PDF-" in head[:1024]
+    if format_name == "djvu":
+        return head.startswith(b"AT&TFORM")
+    return True
+
+
+def djvu_to_pdf(source, target):
+    """Render a DjVu file to PDF with ddjvu (DjVuLibre) so MinerU can read its pages; returns target."""
+    try:
+        subprocess.run(["ddjvu", "-format=pdf", str(source), str(target)], check=True, capture_output=True)
+    except FileNotFoundError:
+        raise ValueError("Для DjVu нужна утилита ddjvu из пакета djvulibre-bin.") from None
+    except subprocess.CalledProcessError as error:
+        detail = error.stderr.decode("utf-8", "replace").strip()[-300:]
+        raise ValueError(f"ddjvu не смог перевести DjVu в PDF: {detail}") from None
+    return target
+
+
+@dataclass(frozen=True)
+class PreparedText:
+    """Article text ready for agents: Markdown body, the reference list kept apart, page count,
+    and the pictures of figures and tables the body links to, by digest."""
+
+    body: str
+    references: str
+    pages: int
+    figures: dict[str, bytes] = field(default_factory=dict)
+
+
+_MINERU_SKIPPED = frozenset({"header", "footer", "page_number"})
+_MINERU_HEADINGS = {"doc_title": "#", "paragraph_title": "##"}
+_MINERU_FIGURES = frozenset({"table", "chart", "image"})
+FIGURE_URL = "/api/files/"  # where the service serves stored pictures
+
+
+def _mineru_spans(content) -> str:
+    """Flatten MinerU spans to text; inline formulas become $…$."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(_mineru_spans(part) for part in content)
+    if isinstance(content, dict):
+        text = _mineru_spans(content.get("content", "")).strip()
+        return f"${text}$" if content.get("type") == "equation_inline" and text else text
+    return ""
+
+
+def _mineru_block(block: dict, links: dict[str, str]) -> str:
+    """Render one MinerU block as Markdown.
+
+    Figures and tables become a link to their picture plus the caption; tables also keep their HTML.
+    `links` maps MinerU's image paths to the URLs of the stored pictures.
+    """
+    kind = block.get("type")
+    content = block.get("content", "")
+    if kind == "equation":
+        latex = _mineru_spans(content).strip()
+        return f"$$\n{latex}\n$$" if latex else ""
+    if kind in _MINERU_FIGURES and isinstance(content, list):
+        parts = []
+        for part in content:
+            part_kind = part.get("type", "") if isinstance(part, dict) else ""
+            if part_kind.endswith("_body"):
+                if part.get("image_path") in links:
+                    parts.append(f"![{kind}]({links[part['image_path']]})")
+                if part_kind == "table_body":
+                    parts.append(_mineru_spans(part.get("content", "")).strip())
+            else:
+                parts.append(" ".join(_mineru_spans(part).split()))
+        return "\n\n".join(filter(None, parts))
+    text = " ".join(_mineru_spans(content).split())
+    return f"{_MINERU_HEADINGS[kind]} {text}" if text and kind in _MINERU_HEADINGS else text
+
+
+def from_mineru(middle: dict, images: dict[str, bytes] | None = None) -> PreparedText:
+    """Build prepared text from MinerU middle JSON: page markers, headings, LaTeX, tables, captions,
+    and links to the pictures of figures and tables (`images`: MinerU image path → bytes).
+
+    Running headers, footers and page numbers are dropped; references are returned separately.
+    """
+    pages = middle.get("pages") if isinstance(middle, dict) else None
+    if not isinstance(pages, list) or not pages:
+        raise ValueError("MinerU вернул разбор без страниц.")
+    figures = {name: hashlib.sha256(data).hexdigest() for name, data in (images or {}).items()}
+    links = {name: FIGURE_URL + digest + PurePosixPath(name).suffix.lower() for name, digest in figures.items()}
+    body, references = [], []
+    for page in pages:
+        body.append(f"<!-- page: {int(page.get('page_idx', 0)) + 1} -->")
+        for block in page.get("blocks") or []:
+            if not isinstance(block, dict) or block.get("type") in _MINERU_SKIPPED:
+                continue
+            text = _clean_text(_mineru_block(block, links))
+            if not text:
+                continue
+            (references if block.get("type") == "ref_text" else body).append(text)
+    if not any(_has_text(part) for part in body if not _PAGE_COMMENT.fullmatch(part)):
+        raise ValueError("MinerU не нашёл в PDF текста. Для скана нужен уровень разбора с OCR.")
+    return PreparedText("\n\n".join(body), "\n".join(references), len(pages),
+                        {figures[name]: data for name, data in (images or {}).items()})
 
 
 def _chunk_section(text: str, target: int, overlap: int) -> Iterator[str]:
@@ -303,8 +405,9 @@ def chunks(text: str, target: int = 1800, overlap: int = 180) -> Iterator[dict]:
             lines.append(line)
             continue
         page_marker = _PAGE_MARKER.fullmatch(line) if fence is None else None
+        page_comment = _PAGE_COMMENT.fullmatch(line) if fence is None else None
         heading = _HEADING.fullmatch(line) if fence is None else None
-        if not (page_marker or heading):
+        if not (page_marker or page_comment or heading):
             lines.append(line)
             continue
         yield from flush()
@@ -312,6 +415,8 @@ def chunks(text: str, target: int = 1800, overlap: int = 180) -> Iterator[dict]:
         if page_marker:
             page = int(page_marker[1])
             headings.clear()
+        elif page_comment:
+            page = int(page_comment[1])
         elif heading:
             level = len(heading[1])
             while headings and headings[-1][0] >= level:

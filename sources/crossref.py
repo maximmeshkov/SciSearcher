@@ -40,11 +40,13 @@ def _fetch_works(get: Getter, params: dict) -> dict:
 
 
 def _crossref_date(item):
-    for name in ("published", "published-online", "published-print", "issued"):
-        parts = ((item.get(name) or {}).get("date-parts") or [[]])[0]
-        if len(parts) == 3:
+    # A full date wins. A year or year-month alone is padded with 01 so the record keeps a date.
+    dates = [((item.get(name) or {}).get("date-parts") or [[]])[0]
+             for name in ("published", "published-online", "published-print", "issued")]
+    for parts in sorted(dates, key=len, reverse=True):
+        if parts:
             try:
-                return date(*parts).isoformat()
+                return date(*(list(parts) + [1, 1])[:3]).isoformat()
             except (TypeError, ValueError):
                 pass
     return ""

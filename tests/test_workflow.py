@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.error import HTTPError
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
 from pypdf import PdfWriter
@@ -258,6 +258,49 @@ class WorkflowTest(unittest.TestCase):
         with patch.object(self.catalog, "attach", return_value=False):
             self.request(f"/api/articles/{article_id}/file?format=txt", "PUT", b"Test text", expected=404,
                          mime="text/plain")
+
+    def upload(self, library_id, name, data, expected=201):
+        return self.request(f"/api/libraries/{library_id}/files?name={quote(name)}", "POST", data, expected,
+                            mime="application/octet-stream")
+
+    def test_library_without_search_takes_files_and_reports_repeats(self):
+        self.request("/api/libraries", "POST", {"name": "No phrases", "sources": [{"kind": "openalex"}]}, 400)
+        manual = self.request("/api/libraries", "POST", {"name": "Datasheets", "keywords": [], "sources": []}, 201)
+        notes = self.upload(manual["id"], "notes.md", b"# Pinout\n\nVDD is pin 1.")
+        self.assertEqual((notes["duplicate"], notes["content_kind"]), (False, "full_text"))
+        again = self.upload(manual["id"], "renamed-copy.md", b"# Pinout\n\nVDD is pin 1.")
+        self.assertEqual((again["id"], again["duplicate"]), (notes["id"], True))
+        sheet = self.upload(manual["id"], "LM5170 datasheet.pdf", self.pdf)
+        self.assertEqual((sheet["content_kind"], sheet["local_pdf"]), ("full_text", True))
+        self.upload(manual["id"], "book.djvu", b"AT&TFORM pages", expected=422)  # no MinerU in this test
+        self.upload(manual["id"], "fake.pdf", b"<html>not a pdf</html>", expected=422)
+        self.upload(manual["id"], "tool.exe", b"MZ", expected=415)
+
+        items = self.request(f"/api/libraries/{manual['id']}/articles")["items"]
+        self.assertEqual(sorted(item["title"] for item in items), ["LM5170 datasheet", "notes"])
+        self.assertEqual({tuple(item["sources"]) for item in items}, {("upload",)})
+        self.assertEqual(self.request(f"/api/articles/{sheet['id']}/pdf"), self.pdf)
+        self.assertIn(b"10 GHz", self.request(f"/api/libraries/{manual['id']}/export.md?full_text=1"))
+        stats = next(row for row in self.request("/api/libraries") if row["id"] == manual["id"])
+        self.assertEqual((stats["article_count"], stats["full_text_count"], stats["pdf_count"]), (2, 2, 1))
+        self.request(f"/api/libraries/{manual['id']}/run", "POST", expected=202)
+        self.assertEqual(self.wait_for_run(manual["id"])["found"], 0)
+
+    def test_uploaded_pdf_and_djvu_wait_for_mineru_in_the_parse_queue(self):
+        self.indexer.parser = object()  # any parser: these files go to the queue, not to pypdf
+        library = self.request("/api/libraries", "POST", {"name": "Books"}, 201)["id"]
+        book = self.upload(library, "book.djvu", b"AT&TFORM pages")
+        self.assertEqual((book["parse_status"], book["local_pdf"]), ("pending", True))
+        self.assertEqual(self.catalog.next_parse()[:2], (book["id"], "djvu"))
+        sheet = self.upload(library, "sheet.pdf", self.pdf)
+        self.assertEqual(self.catalog.next_parse(), (sheet["id"], "pdf", self.catalog.attachment(sheet["id"], "pdf")))
+        self.assertEqual(self.request(f"/api/articles/{book['id']}/pdf"), b"AT&TFORM pages")
+
+    def test_stored_pictures_are_served_by_digest(self):
+        digest = self.catalog.files.save([b"\xff\xd8\xff picture"])
+        self.assertEqual(self.request(f"/api/files/{digest}.jpg"), b"\xff\xd8\xff picture")
+        self.request(f"/api/files/{'0' * 64}.jpg", expected=404)
+        self.request(f"/api/files/{digest}.svg", expected=404)
 
     def test_new_adapter_uses_registry_and_generic_fields(self):
         kind = "rf_catalog"

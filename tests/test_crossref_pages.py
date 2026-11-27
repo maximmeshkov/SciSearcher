@@ -59,6 +59,17 @@ class CrossrefPagesTest(unittest.TestCase):
         self.assertEqual([p["doi"] for p in search({}, "load-pull", date.min, 1, get)], ["10.1234/load-pull.1"])
         self.assertNotIn("cursor", calls[0])
 
+    def test_pads_partial_dates_and_prefers_a_full_one(self):
+        _, get = self.getter({"items": [
+            {"DOI": "10.1234/a", "title": ["A"], "published": {"date-parts": [[2026, 6]]}},
+            {"DOI": "10.1234/b", "title": ["B"], "published": {"date-parts": [[2026]]}},
+            {"DOI": "10.1234/c", "title": ["C"], "published": {"date-parts": [[2026, 6]]},
+             "published-online": {"date-parts": [[2026, 6, 15]]}},
+            {"DOI": "10.1234/d", "title": ["D"], "issued": {"date-parts": [[None]]}},
+        ]})
+        self.assertEqual([p["published"] for p in search({}, "load-pull", date.min, 4, get)],
+                         ["2026-06-01", "2026-01-01", "2026-06-15", ""])
+
     def test_invalid_message_marks_query_as_failed(self):
         _, get = self.getter({"items": "malformed"})
         with self.assertRaises(ValueError):
