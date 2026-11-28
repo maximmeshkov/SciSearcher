@@ -17,6 +17,7 @@ from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from app import Indexer, make_server, matcher, standardized
 from catalog import Catalog
+from documents import PDF_RENDERER
 from sources import _REGISTRY, fetch
 
 
@@ -194,18 +195,25 @@ class WorkflowTest(unittest.TestCase):
 
     def test_openalex_cache_is_tried_after_a_failed_pdf_link(self):
         library = self.add_library("Load-pull", ["load-pull"], [{"kind": "openalex"}], enabled=False)
-        def failed_download(url, limit, *, accept):
-            self.assertEqual((url, accept), (COPY, "application/pdf"))
-            raise ValueError("Publisher returned HTTP 502")
+        cached = "https://content.openalex.org/works/W42.pdf"
+        def download(url, limit, *, accept):
+            if url == COPY:
+                raise ValueError("Publisher returned HTTP 502")
+            if accept == "application/json" and url.startswith("https://api.openalex.org/works/W42?"):
+                return json.dumps({"id": "https://openalex.org/W42", "doi": SAMPLE_DOI,
+                    "has_content": {"pdf": True}, "content_urls": {"pdf": cached},
+                    "best_oa_location": {"is_oa": True, "license": "cc0"}}).encode()
+            self.assertEqual((url, accept), (cached + "?api_key=test-key", "application/pdf"))
+            return self.pdf
 
-        self.indexer.download = failed_download
-        with (patch.dict("os.environ", {"OPENALEX_API_KEY": "test-key"}),
-              patch("app.cached_pdf", return_value=self.pdf) as cache):
+        self.indexer.download = download
+        with patch.dict("os.environ", {"OPENALEX_API_KEY": "test-key"}):
             self.request(f"/api/libraries/{library}/run", "POST", expected=202)
             run = self.wait_for_run(library)
             self.assertEqual(run["downloaded"], 1)
-            self.assertEqual(cache.call_args.args[0], "https://openalex.org/W42")
         [article] = self.request(f"/api/libraries/{library}/articles")["items"]
+        self.assertEqual(self.catalog.article(article["id"])["pdf_url"], cached)
+        self.assertEqual(self.catalog.article(article["id"])["license"], "cc0")
         self.assertEqual(self.request(f"/api/articles/{article['id']}/pdf"), self.pdf)
 
     def test_health_checks_catalog_and_worker_without_basic_auth(self):
@@ -297,10 +305,47 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(self.request(f"/api/articles/{book['id']}/pdf"), b"AT&TFORM pages")
 
     def test_stored_pictures_are_served_by_digest(self):
-        digest = self.catalog.files.save([b"\xff\xd8\xff picture"])
-        self.assertEqual(self.request(f"/api/files/{digest}.jpg"), b"\xff\xd8\xff picture")
+        library = self.add_library("Manual", [], [], enabled=False)
+        article = self.upload(library, "sample.pdf", self.pdf)["id"]
+        image = b"\xff\xd8\xff picture"
+        digest = self.catalog.files.save([image])
+        self.request(f"/api/files/{digest}.jpg", expected=404)
+        self.catalog.save_parsed(article, SimpleNamespace(
+            body=f"![Figure](/api/files/{digest}.jpg)", references="", figures={digest: image}))
+        self.assertEqual(self.request(f"/api/files/{digest}.jpg"), image)
         self.request(f"/api/files/{'0' * 64}.jpg", expected=404)
         self.request(f"/api/files/{digest}.svg", expected=404)
+        self.catalog.exclude(library, article, global_scope=True)
+        self.request(f"/api/files/{digest}.jpg", expected=404)
+
+    def test_blocked_reupload_does_not_recreate_purged_bytes(self):
+        library = self.add_library("Manual", [], [], enabled=False)
+        article = self.upload(library, "sample.pdf", self.pdf)["id"]
+        digest = self.catalog.attachment(article, "pdf")
+        self.request(f"/api/libraries/{library}/articles/{article}/exclude", "POST", {"purge": True})
+        self.assertFalse(self.catalog.files.path(digest).exists())
+        self.upload(library, "same bytes.pdf", self.pdf, expected=409)
+        self.assertFalse(self.catalog.files.path(digest).exists())
+        self.assertEqual(list(self.catalog.files.root.glob(".incoming-*")), [])
+
+    @unittest.skipUnless(PDF_RENDERER, "Poppler is supplied by the Docker image")
+    def test_renders_requested_original_page_and_hides_it_after_exclusion(self):
+        library = self.request("/api/libraries", "POST", {"name": "Sources"}, 201)["id"]
+        writer = PdfWriter()
+        writer.add_blank_page(200, 100)
+        writer.add_blank_page(100, 200)
+        buffer = io.BytesIO()
+        writer.write(buffer)
+        self.indexer.parser = object()
+        aid = self.upload(library, "orientation.pdf", buffer.getvalue())["id"]
+        route = f"/api/articles/{aid}/pages/"
+        for page, expected in [(1, (1600, 800)), (2, (800, 1600))]:
+            png = self.request(route + str(page) + ".png")
+            self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+            self.assertEqual(tuple(int.from_bytes(png[n:n+4], "big") for n in (16, 20)), expected)
+        self.request(route + "3.png", expected=422)
+        self.request(f"/api/libraries/{library}/articles/{aid}/exclude", "POST", {})
+        self.request(route + "1.png", expected=404)
 
     def test_new_adapter_uses_registry_and_generic_fields(self):
         kind = "rf_catalog"

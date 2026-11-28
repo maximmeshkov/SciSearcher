@@ -10,14 +10,20 @@ services:
       OPENALEX_API_KEY: ${OPENALEX_API_KEY:-}
       IEEE_API_KEY: ${IEEE_API_KEY:-}
       CROSSREF_MAILTO: ${CROSSREF_MAILTO:-}
-      # An explicitly empty MINERU_URL turns MinerU off: PDF text then comes from pypdf.
-      MINERU_URL: ${MINERU_URL-http://mineru:8000}
+      MINERU_URL: ${MINERU_URL:-}
+      MINERU_API_KEY: ${MINERU_API_KEY:-}
       MINERU_TIER: ${MINERU_TIER:-}
       MINERU_TIMEOUT_HOURS: ${MINERU_TIMEOUT_HOURS:-48}
       PARSE_WORKERS: ${PARSE_WORKERS:-1}
       MAX_DOWNLOAD_MB: ${MAX_DOWNLOAD_MB:-200}
+      QDRANT_URL: ${QDRANT_URL:-}
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      RAG_BASE_URL: ${RAG_BASE_URL:-http://host.docker.internal:1234/v1}
+      RAG_EMBEDDING_MODEL: ${RAG_EMBEDDING_MODEL:-}
+      RAG_CHAT_MODEL: ${RAG_CHAT_MODEL:-}
+      RAG_API_KEY: ${RAG_API_KEY:-}
     volumes:
-      - library-data:/data
+      - "${SCISEARCHER_DATA:-library-data}:/data"
     healthcheck:
       test:
         - CMD
@@ -33,34 +39,5 @@ services:
       retries: 3
       start_period: 10s
 
-  # PDF parsing. Reachable only from scisearcher on the compose network, so it has no published port.
-  mineru:
-    build:
-      context: .
-      dockerfile: Dockerfile.mineru
-    image: "${MINERU_IMAGE:-scisearcher-mineru:local}"
-    restart: unless-stopped
-    environment:
-      MINERU_DEVICE_MODE: ${MINERU_DEVICE:-cpu}
-      MINERU_MODEL_ONNX_DEVICE: ${MINERU_DEVICE:-cpu}
-      MINERU_SERVER_TIER: ${MINERU_SERVER_TIER:-auto}
-      PARSE_WORKERS: ${PARSE_WORKERS:-1}
-    volumes:
-      - mineru-models:/models
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - -c
-        - |
-          import urllib.request
-          urllib.request.urlopen("http://127.0.0.1:8000/v1/health", timeout=3)
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      # The first start downloads about 1.4 GB of models.
-      start_period: 30m
-
 volumes:
   library-data:
-  mineru-models:

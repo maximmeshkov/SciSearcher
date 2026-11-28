@@ -14,6 +14,15 @@ import zipfile
 from pathlib import Path
 from urllib.parse import quote
 
+class MinerUHTTPError(ValueError):
+    def __init__(self, status, detail):
+        super().__init__(f"MinerU: HTTP {status} {detail}")
+        self.status = status
+
+
+class TerminalTask(ValueError):
+    """A finished task cannot supply a valid result on a later attempt."""
+
 
 class MinerU:
     """One MinerU API server: base URL, optional API key and parse tier."""
@@ -32,6 +41,44 @@ class MinerU:
         self.upload(upload, path)
         return result_parts(self.download(self.wait(task_id)))
 
+    def parse_queued(self, pdf_path, file_name, catalog, article_id, digest, *, prepare):
+        """Resume an existing task on this server; persist a new ID before sending any document bytes."""
+        key = (article_id, digest, self.url, self.tier)
+        saved = catalog.mineru_task(key)
+        # A server restart or retention expiry can invalidate a saved ID. Replace it once in this attempt.
+        for attempt in range(2):
+            resumed = saved is not None
+            if not saved:
+                task_id, _ = self.create_task(file_name, pdf_path().stat().st_size)
+                saved = catalog.mineru_task(key, created=(task_id, int(time.time())))
+                if not saved:
+                    return None  # The user purged, replaced or hid this document during creation.
+            task_id, created_at = saved
+            try:
+                # Renew a stale result URL once through task status, without resubmitting the PDF.
+                for lookup in range(2):
+                    url = self.wait(task_id, pdf_path=pdf_path, started_at=created_at)
+                    try:
+                        raw = self.download(url)
+                        break
+                    except MinerUHTTPError as error:
+                        if lookup or error.status not in (401, 403, 404, 410):
+                            raise
+                try:
+                    return prepare(*result_parts(raw))
+                except (ValueError, KeyError, zipfile.BadZipFile) as error:
+                    raise TerminalTask(str(error)) from error
+            except MinerUHTTPError as error:
+                if error.status not in (404, 410):
+                    raise
+                catalog.forget_mineru_task(key, task_id)
+                if not resumed or attempt:
+                    raise
+                saved = None
+            except TerminalTask:
+                catalog.forget_mineru_task(key, task_id)
+                raise
+
     def create_task(self, file_name, size):
         """Register one file; returns (task_id, upload link)."""
         request = {"output_formats": ["default"], "files": [{"file_name": file_name, "bytes": size}]}
@@ -48,9 +95,11 @@ class MinerU:
         with path.open("rb") as body:
             self._call("PUT", upload["url"], body, headers)
 
-    def wait(self, task_id):
+    def wait(self, task_id, *, pdf_path=None, started_at=None):
         """Poll the task until its file is parsed; returns the result URL."""
-        deadline = time.monotonic() + self.timeout_seconds
+        elapsed = max(0, time.time() - started_at) if started_at is not None else 0
+        deadline = time.monotonic() + self.timeout_seconds - elapsed
+        uploaded = False
         while True:
             task = json.loads(self._call("GET", f"{self.url}/v1/tasks/{quote(task_id, safe='')}"))
             item = task["files"][0]
@@ -58,10 +107,23 @@ class MinerU:
                 return item["result_url"]
             if item["status"] in ("failed", "canceled") or task["status"] in ("failed", "canceled"):
                 error = item.get("error") or task.get("error") or {}
-                raise ValueError(f"MinerU: {error.get('message') or item['status']}")
+                raise TerminalTask(f"MinerU: {error.get('message') or item['status']}")
             if time.monotonic() > deadline:
                 self._call("POST", f"{self.url}/v1/tasks/{quote(task_id, safe='')}/cancel")
-                raise TimeoutError("MinerU не успел разобрать файл за отведённое время.")
+                raise TerminalTask("MinerU не успел разобрать файл за отведённое время.")
+            link = item.get("upload")
+            if item["status"] == "waiting-file" and link and pdf_path is not None and not uploaded:
+                expires_at = link.get("expires_at")
+                if isinstance(expires_at, (int, float)) and expires_at <= time.time():
+                    raise MinerUHTTPError(410, "Истёк срок передачи файла.")
+                try:
+                    self.upload(link, pdf_path())
+                except MinerUHTTPError as error:
+                    if error.status != 409:
+                        raise
+                    raise ConnectionError("MinerU уточняет состояние передачи файла.") from None
+                uploaded = True
+                continue
             time.sleep(self.poll_seconds)
 
     def download(self, result_url):
@@ -77,8 +139,10 @@ class MinerU:
             with urllib.request.urlopen(request, timeout=120) as response:
                 return response.read()
         except urllib.error.HTTPError as error:
+            if error.code in (429, 502, 503, 504):
+                raise ConnectionError(f"MinerU временно недоступен (HTTP {error.code}).") from None
             detail = error.read(300).decode("utf-8", "replace")
-            raise ValueError(f"MinerU: HTTP {error.code} {detail}") from None
+            raise MinerUHTTPError(error.code, detail) from None
         except (urllib.error.URLError, OSError) as error:
             # The server is down or restarting: not the article's fault, so callers retry without penalty.
             raise ConnectionError(f"MinerU недоступен: {getattr(error, 'reason', error)}") from None

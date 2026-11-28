@@ -1,0 +1,37 @@
+services:
+  scisearcher:
+    environment:
+      MINERU_URL: ${MINERU_URL-http://mineru:8000}
+
+  # PDF parsing. Reachable only from scisearcher on the compose network, so it has no published port.
+  mineru:
+    build:
+      context: .
+      dockerfile: Dockerfile.mineru
+    image: "${MINERU_IMAGE:-scisearcher-mineru:local}"
+    cpus: "${MINERU_CPUS:-0}"
+    restart: unless-stopped
+    environment:
+      MINERU_DEVICE_MODE: ${MINERU_DEVICE:-cpu}
+      MINERU_MODEL_ONNX_DEVICE: ${MINERU_DEVICE:-cpu}
+      MINERU_SERVER_TIER: ${MINERU_SERVER_TIER:-auto}
+      MINERU_TIMEOUT_HOURS: ${MINERU_TIMEOUT_HOURS:-48}
+      PARSE_WORKERS: ${PARSE_WORKERS:-1}
+    volumes:
+      - mineru-models:/models
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import urllib.request
+          urllib.request.urlopen("http://127.0.0.1:8000/v1/health", timeout=3)
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # The first start downloads about 1.4 GB of models.
+      start_period: 30m
+
+volumes:
+  mineru-models:

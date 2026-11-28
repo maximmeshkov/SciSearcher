@@ -6,8 +6,12 @@ RUN pip install --no-cache-dir "mineru==4.2.3" \
     && mkdir -p /models /tmp/mineru-upload \
     && chown 10001:10001 /models /tmp/mineru-upload
 
+# Older model volumes can contain root-owned /models/.cache from pip during the image build.
+# Keep MinerU's installed models in /models/.mineru and use writable sibling directories for hub caches.
+ENV HF_HOME=/models/huggingface MODELSCOPE_CACHE=/models/modelscope XDG_CACHE_HOME=/models/runtime-cache
 USER 10001:10001
 EXPOSE 8000
 # Shell form so that compose settings reach the flags: tier ceiling and parallel parses.
 CMD exec mineru-kit api-server --host 0.0.0.0 --port 8000 --tier "${MINERU_SERVER_TIER:-auto}" \
-    --concurrency "${PARSE_WORKERS:-1}" --upload-dir /tmp/mineru-upload --preload-models
+    --concurrency "${PARSE_WORKERS:-1}" --task-timeout "$(python -c 'import os; print(max(1, int(3600 * float(os.getenv("MINERU_TIMEOUT_HOURS", "48")))))')" \
+    --upload-dir /tmp/mineru-upload --preload-models

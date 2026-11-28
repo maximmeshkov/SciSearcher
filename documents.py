@@ -6,8 +6,29 @@ import hashlib
 from io import BytesIO
 from pathlib import PurePosixPath
 import re
+import shutil
 import subprocess
 from xml.etree import ElementTree as ET
+
+
+PDF_RENDERER = shutil.which("pdftoppm")
+
+
+def pdf_page_png(path, page):
+    """Render the selected one-based physical page with a bounded output size."""
+    if not PDF_RENDERER:
+        raise FileNotFoundError("Для просмотра страницы нужен pdftoppm из poppler-utils.")
+    try:
+        result = subprocess.run(
+            [PDF_RENDERER, "-f", str(page), "-l", str(page), "-singlefile", "-scale-to", "1600",
+             "-png", str(path.resolve())], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=45, check=True,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise ValueError("Не удалось открыть эту страницу PDF.") from error
+    if not result.stdout.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("Не удалось получить изображение страницы.")
+    return result.stdout
 
 
 # Limits of the pypdf fallback, used only when MinerU is off.

@@ -19,6 +19,7 @@ class SourceSpec(TypedDict):
     description: str
     mode: Literal["search", "feed"]
     fields: list[Field]
+    export_abstract: NotRequired[bool]
 
 
 class Candidate(TypedDict, total=False):

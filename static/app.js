@@ -1,7 +1,7 @@
 "use strict";
 
 const byId = (id) => document.getElementById(id);
-const scopes = new Set(["all", "full_text", "pdf"]);
+const scopes = new Set(Array.from(byId("scope-filter").options, (option) => option.value));
 const requestedScope = new URL(location.href).searchParams.get("scope");
 const contentNames = {
   full_text: "Полный текст",
@@ -37,6 +37,21 @@ function pdfState(article) {
   const label = pdfProblemNames[article.download_status];
   return label ? { label, detail: article.download_error || "", className: "badge warning" } : null;
 }
+
+function discoveryState(article) {
+  if (article.content_kind === "full_text" || article.local_pdf) return null;
+  const labels = {
+    queued: "В очереди поиска файла", checking: "Проверяем доступные копии",
+    no_copy: "Источники пока не вернули доступную копию", failed: "Ошибка поиска копии",
+  };
+  const label = labels[article.discovery_status];
+  if (!label) return null;
+  const details = [label, article.discovery_detail];
+  if (["no_copy", "failed"].includes(article.discovery_status) && article.discovery_next_try > 0) {
+    details.push("Следующая проверка " + dateFormat.format(new Date(article.discovery_next_try * 1000)));
+  }
+  return { label, details: details.filter(Boolean).join(" · ") };
+}
 const runNames = {
   queued: "В очереди",
   running: "Идёт сбор",
@@ -56,16 +71,23 @@ const state = {
   id: new URL(location.href).searchParams.get("library"),
   search: "",
   scope: scopes.has(requestedScope) ? requestedScope : "all",
+  scopeExplicit: scopes.has(requestedScope),
   offset: 0,
   limit: 25,
   editorId: null,
   article: null,
+  exclusion: null,
   articleRequest: 0,
   listRequest: 0,
   runRequest: 0,
   refresh: null,
   sourceTypes: [],
   sourceRequest: null,
+  view: new URL(location.href).searchParams.get("view") === "research" ? "research" : "catalog",
+  questionRequest: 0,
+  settings: null,
+  statusRequest: 0,
+  resolving: new Set(),
 };
 
 function make(tag, className, text) {
@@ -139,8 +161,10 @@ function rememberSelection() {
   const url = new URL(location.href);
   if (state.id) url.searchParams.set("library", state.id);
   else url.searchParams.delete("library");
-  if (state.scope === "all") url.searchParams.delete("scope");
+  if (!state.scopeExplicit) url.searchParams.delete("scope");
   else url.searchParams.set("scope", state.scope);
+  if (state.view === "research") url.searchParams.set("view", "research");
+  else url.searchParams.delete("view");
   if (location.href !== url.href) history.replaceState(null, "", url);
 }
 
@@ -202,6 +226,7 @@ function renderLibrary() {
   byId("workspace").hidden = !library;
   if (!library) {
     byId("welcome-create").hidden = false;
+    byId("welcome-connect").hidden = false;
     byId("welcome-message").textContent =
       "Создай библиотеку: с поиском по источникам или для своих файлов.";
     return;
@@ -217,14 +242,11 @@ function renderLibrary() {
   for (const [id, count] of [
     ["stat-articles", library.article_count],
     ["stat-full-text", library.full_text_count],
-    ["stat-pdf", library.pdf_count],
+    ["stat-pdf", library.pdf_count], ["stat-metadata", library.metadata_only_count],
   ]) {
     byId(id).textContent = Number.isInteger(count) ? numberFormat.format(count) : "—";
   }
-  const waiting = library.parse_waiting || 0;
-  const failed = library.parse_failed || 0;
-  byId("stat-parse-box").hidden = !(waiting || failed);
-  byId("stat-parse").textContent = numberFormat.format(waiting) + (failed ? " · ошибок " + numberFormat.format(failed) : "");
+  updateScopeControls(library);
   const status = library.last_status;
   const runStatus = byId("run-status");
   runStatus.className = runClass(status);
@@ -237,14 +259,18 @@ function renderLibrary() {
 function selectLibrary(id) {
   if (id === state.id) return;
   state.id = id;
+  state.scopeExplicit = false;
+  applyDefaultScope();
   state.search = "";
   state.offset = 0;
   byId("search").value = "";
+  resetResearch();
   rememberSelection();
   renderNavigation();
   renderLibrary();
   showNotice("");
   void loadArticles(true);
+  void loadIndexStatus();
 }
 
 function articleMeta(article) {
@@ -261,7 +287,13 @@ function articleCard(article) {
   const open = make("button", "article-open", article.title || article.doi || "Статья");
   open.type = "button";
   open.dataset.article = String(article.id);
-  open.addEventListener("click", () => openArticle(article));
+  const excluded = state.scope === "excluded";
+  if (excluded) {
+    open.disabled = true;
+    open.className = "excluded-title";
+  } else {
+    open.addEventListener("click", () => openArticle(article));
+  }
   heading.append(open);
   const kind = article.content_kind;
   const top = make("div", "article-top");
@@ -278,7 +310,7 @@ function articleCard(article) {
   if (article.sources?.length) {
     links.append(make("span", "secondary", article.sources.map(sourceLabel).join(", ")));
   }
-  if (article.local_pdf) {
+  if (article.local_pdf && !excluded) {
     const pdf = make("a", "", "Файл ↗");
     pdf.href = articlePath(article.id) + "/pdf";
     pdf.target = "_blank";
@@ -291,7 +323,25 @@ function articleCard(article) {
     if (pdf.detail) badge.title = pdf.detail;
     links.append(badge);
   }
+  const discovery = discoveryState(article);
+  if (discovery) {
+    const badge = make("span", "badge", discovery.label);
+    badge.title = discovery.details;
+    links.append(badge);
+  }
   if (links.childElementCount) card.append(links);
+  if (excluded) {
+    const actions = make("div", "action-row article-management");
+    if (article.library_excluded) actions.append(restoreButton(article, false));
+    if (article.global_excluded) actions.append(restoreButton(article, true));
+    if (article.local_pdf || article.content_kind === "full_text") {
+      const purge = make("button", "text-button", "Удалить сохранённые файлы и текст");
+      purge.type = "button";
+      purge.addEventListener("click", () => showExclusion(article, true));
+      actions.append(purge);
+    }
+    card.append(actions);
+  }
   return card;
 }
 
@@ -314,7 +364,20 @@ async function loadArticles(indicate = false) {
     if (request !== state.listRequest || id !== state.id) return;
     const {items, total, limit, offset} = response;
     state.limit = limit;
+    if (offset > 0 && !items.length && total > 0) {
+      state.offset = Math.floor((total - 1) / limit) * limit;
+      return loadArticles(true);
+    }
     state.offset = offset;
+    if (state.article && byId("article-dialog").open) {
+      const updated = items.find((item) => item.id === state.article.id);
+      if (updated) {
+        const changedText = updated.content_kind !== state.article.content_kind;
+        Object.assign(state.article, updated);
+        setPreviewFiles(state.article);
+        if (changedText) void loadText(state.article);
+      }
+    }
     byId("result-count").textContent = numberFormat.format(total);
     const signature = JSON.stringify(items);
     if (list.dataset.signature !== signature) {
@@ -330,6 +393,8 @@ async function loadArticles(indicate = false) {
     const emptyMessage = state.search ? "По запросу ничего не найдено."
       : state.scope === "full_text" ? "В этой библиотеке пока нет извлечённых полных текстов."
       : state.scope === "pdf" ? "В этой библиотеке пока нет локальных файлов."
+      : state.scope === "excluded" ? "В чёрном списке пока нет статей."
+      : state.scope !== "all" ? "Статей с этим статусом нет."
       : selected()?.sources.length ? "Пока здесь нет статей. Запусти поиск по источникам."
       : "Пока здесь нет файлов. Добавь их кнопкой «Добавить файлы» или «Добавить папку».";
     show(resultsMessage, items.length ? "" : emptyMessage, "secondary");
@@ -351,14 +416,19 @@ function refreshLibraries() {
       const previous = selected();
       state.libraries = await api("/api/libraries");
       if (!selected()) state.id = state.libraries.length ? String(state.libraries[0].id) : null;
+      if (!previous || previous.id !== selected()?.id) applyDefaultScope();
       rememberSelection();
       renderNavigation();
       renderLibrary();
       const current = selected();
       if (current && (!previous || previous.id !== current.id)) {
+        resetResearch();
+        void loadIndexStatus();
         await loadArticles(true);
-      } else if (current && ["last_status", "last_run_at", "article_count", "full_text_count", "pdf_count"]
-          .some((key) => previous[key] !== current[key])) {
+      } else if (current && ((state.view === "catalog" && !byId("catalog-recovery").hidden) ||
+          ["last_status", "last_run_at", "article_count", "full_text_count", "pdf_count",
+          "parse_waiting", "parse_failed", "excluded_count", "download_failed_count", "no_pdf_count"]
+          .some((key) => previous[key] !== current[key]))) {
         await loadArticles();
       }
       if (current && byId("runs-dialog").open) void loadRuns();
@@ -592,6 +662,10 @@ function setPreviewFiles(article) {
   kind.className = article.content_kind === "full_text" ? "badge success" : "badge";
   const pdfLine = pdfState(article);
   show(byId("preview-download"), pdfLine ? [pdfLine.label, pdfLine.detail].filter(Boolean).join(" · ") : "");
+  show(byId("preview-discovery"), discoveryState(article)?.details || "");
+  byId("retry-article").hidden = article.content_kind === "full_text" || article.local_pdf;
+  byId("retry-article").disabled = state.resolving.has(state.id + "/" + article.id);
+  byId("reparse-article").hidden = !article.local_pdf || article.parse_status !== "failed";
 }
 
 async function loadText(article) {
@@ -619,6 +693,7 @@ function openArticle(article) {
   state.article = { ...article };
   byId("preview-heading").textContent = article.title || article.doi || "Статья";
   byId("preview-meta").textContent = [articleMeta(article), article.doi].filter(Boolean).join(" · ");
+  show(byId("preview-folder"), article.folder ? "Папка в каталоге данных NAS · " + article.folder : "");
   byId("attach-form").reset();
   byId("attach-button").disabled = false;
   show(byId("attach-status"), "");
@@ -743,16 +818,8 @@ byId("search-form").addEventListener("submit", (event) => {
   void loadArticles(true);
 });
 const scopeFilter = byId("scope-filter");
-for (const option of scopeFilter.querySelectorAll("input")) {
-  option.checked = option.value === state.scope;
-}
-scopeFilter.addEventListener("change", (event) => {
-  if (!scopes.has(event.target.value)) return;
-  state.scope = event.target.value;
-  state.offset = 0;
-  rememberSelection();
-  void loadArticles(true);
-});
+scopeFilter.value = state.scope;
+scopeFilter.addEventListener("change", (event) => selectScope(event.target.value));
 byId("previous-page").addEventListener("click", () => {
   state.offset = Math.max(0, state.offset - state.limit);
   void loadArticles(true);
@@ -770,7 +837,557 @@ for (const button of document.querySelectorAll("[data-close]")) {
   button.addEventListener("click", () => byId(button.dataset.close).close());
 }
 
+function sendJson(method, data) {
+  return { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) };
+}
+
+function scopedArticlePath(libraryId, articleId) {
+  return libraryPath(libraryId) + "/articles/" + encodeURIComponent(articleId);
+}
+
+function updateView() {
+  const research = state.view === "research";
+  byId("research-panel").hidden = !research;
+  byId("catalog-panel").hidden = research;
+  byId("research-view").setAttribute("aria-pressed", String(research));
+  byId("indexed-stat").setAttribute("aria-pressed", String(research));
+  byId("catalog-view").setAttribute("aria-pressed", String(!research));
+  for (const button of document.querySelectorAll(".stat[data-scope]")) {
+    button.setAttribute("aria-pressed", String(!research && state.scope === button.dataset.scope));
+  }
+}
+
+function setView(view) {
+  state.view = view;
+  updateView();
+  rememberSelection();
+  if (view === "research") {
+    void loadIndexStatus();
+    if (!state.settings) void api("/api/rag/settings").then(updateModelChoices).catch(() => {});
+  }
+}
+
+function selectScope(value) {
+  if (!scopes.has(value)) return;
+  state.scope = value;
+  state.scopeExplicit = true;
+  state.offset = 0;
+  scopeFilter.value = value;
+  setView("catalog");
+  updateScopeControls(selected());
+  if (!byId("catalog-recovery").hidden) void loadIndexStatus();
+  void loadArticles(true);
+}
+
+function applyDefaultScope() {
+  if (!state.scopeExplicit) state.scope = selected()?.full_text_count > 0 ? "full_text" : "all";
+  scopeFilter.value = state.scope;
+}
+
+function updateScopeControls(library) {
+  const counts = {
+    all: library?.article_count, full_text: library?.full_text_count, metadata_only: library?.metadata_only_count,
+    pdf: library?.pdf_count, no_pdf: library?.no_pdf_count, parse_pending: library?.parse_waiting,
+    parse_failed: library?.parse_failed, download_failed: library?.download_failed_count, excluded: library?.excluded_count,
+  };
+  for (const option of byId("scope-filter").options) {
+    option.dataset.label ??= option.textContent;
+    const count = counts[option.value];
+    option.textContent = option.dataset.label + (Number.isInteger(count) ? " · " + numberFormat.format(count) : "");
+  }
+  byId("catalog-recovery").hidden = !["metadata_only", "no_pdf", "download_failed"].includes(state.scope);
+  byId("retry-library").disabled = state.resolving.has(state.id + "/");
+  updateView();
+}
+
+function resetResearch() {
+  state.questionRequest++;
+  byId("research-question").value = "";
+  byId("research-result").hidden = true;
+  byId("question-form").querySelectorAll("button").forEach((button) => { button.disabled = false; });
+  show(byId("question-status"), "");
+  show(byId("rag-issue"), "");
+  byId("rag-status").textContent = "";
+  byId("stat-indexed").textContent = "—";
+  byId("connect-index").hidden = true;
+  byId("discovery-status").textContent = "Поиск доступных копий для статей библиотеки.";
+}
+
+const indexStates = {
+  idle: "Ожидание новых текстов", indexing: "Идёт индексация",
+  waiting: "Ожидание сервера моделей", unconfigured: "Требуется настройка индекса",
+};
+
+async function loadIndexStatus() {
+  const libraryId = state.id;
+  if (!libraryId) return;
+  const request = ++state.statusRequest;
+  try {
+    const result = await api(libraryPath(libraryId) + "/rag/status");
+    if (libraryId !== state.id || request !== state.statusRequest) return;
+    byId("stat-indexed").textContent = Number.isInteger(result.indexed) ? numberFormat.format(result.indexed) : "—";
+    byId("connect-index").hidden = result.qdrant_url !== "";
+    const details = [];
+    const discovery = result.discovery;
+    if (discovery) {
+      const counters = [
+        ["unchecked", "ожидают проверки"], ["queued", "в очереди"], ["checking", "проверяются"],
+        ["recovered", "найдено копий"], ["no_copy", "копия пока не найдена"], ["failed", "ошибок"],
+      ].filter(([key]) => discovery[key] > 0);
+      byId("discovery-status").textContent = counters.map(([key, label]) =>
+        label + " · " + numberFormat.format(discovery[key])).join(" / ") || "Очередь поиска доступных копий пуста.";
+    }
+    if (Number.isInteger(result.indexed) && Number.isInteger(result.full_text)) {
+      details.push("В индексе " + numberFormat.format(result.indexed) + " из " + numberFormat.format(result.full_text) + " полных текстов");
+    }
+    if (Number.isInteger(result.pending) && result.pending > 0) details.push("в очереди " + numberFormat.format(result.pending));
+    if (indexStates[result.state]) details.push(indexStates[result.state]);
+    byId("rag-status").textContent = details.join(" · ");
+    show(byId("rag-issue"), result.last_error || "");
+  } catch (error) {
+    if (libraryId === state.id && request === state.statusRequest) show(byId("rag-issue"), error.message);
+  }
+}
+
+function restoreButton(article, globalScope) {
+  const libraryId = state.id;
+  const button = make("button", "button", globalScope ? "Снять глобальное исключение" : "Снять исключение библиотеки");
+  button.type = "button";
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      await api(scopedArticlePath(libraryId, article.id) + "/restore", sendJson("POST", { global_scope: globalScope }));
+      if (state.id !== libraryId) return;
+      showNotice("Исключение снято.");
+      await refreshLibraries();
+      await loadArticles();
+    } catch (error) {
+      if (state.id === libraryId) showNotice(error.message, true);
+    } finally { button.disabled = false; }
+  });
+  return button;
+}
+
+function showExclusion(article, purgeOnly = false) {
+  if (!article) return;
+  state.exclusion = { article, libraryId: state.id };
+  byId("exclusion-form").reset();
+  byId("exclusion-title").textContent = article.title || article.doi || "Статья";
+  byId("exclusion-heading").textContent = purgeOnly ? "Удалить файлы статьи" : "Исключить статью";
+  byId("exclusion-help").textContent = purgeOnly ? "Карточка останется в чёрном списке. Для повторной работы с текстом понадобится снова получить файл."
+    : "Статья исчезнет из каталога и из поиска по текстам. Вернуть её можно в чёрном списке.";
+  byId("confirm-exclude").textContent = purgeOnly ? "Удалить файлы и текст" : "Исключить";
+  byId("exclusion-scope").value = purgeOnly && article.global_excluded ? "global" : "library";
+  byId("exclusion-scope").disabled = purgeOnly;
+  byId("purge-files").checked = purgeOnly;
+  byId("purge-files").disabled = purgeOnly;
+  byId("purge-confirmation").hidden = !purgeOnly;
+  byId("confirm-purge").required = purgeOnly;
+  byId("confirm-exclude").disabled = false;
+  show(byId("exclusion-error"), "");
+  modal("exclusion-dialog");
+}
+
+async function excludeArticle(event) {
+  event.preventDefault();
+  const current = state.exclusion;
+  if (!current) return;
+  const { article, libraryId: id } = current;
+  const purge = byId("purge-files").checked;
+  if (purge && !byId("confirm-purge").checked) return;
+  byId("confirm-exclude").disabled = true;
+  try {
+    await api(scopedArticlePath(id, article.id) + "/exclude",
+      sendJson("POST", { global_scope: byId("exclusion-scope").value === "global", purge }));
+    if (id !== state.id) return;
+    if (current === state.exclusion) {
+      byId("exclusion-dialog").close();
+      if (state.article === article && byId("article-dialog").open) byId("article-dialog").close();
+    }
+    resetResearch();
+    showNotice(purge ? "Статья исключена. Её сохранённые файлы и текст удалены." : "Статья добавлена в чёрный список.");
+    await refreshLibraries();
+    await loadArticles();
+  } catch (error) {
+    if (current === state.exclusion) show(byId("exclusion-error"), error.message);
+  } finally { byId("confirm-exclude").disabled = false; }
+}
+
+async function resolveFullText(article) {
+  const id = state.id;
+  const key = id + "/" + (article?.id || "");
+  if (state.resolving.has(key)) return;
+  const button = byId(article ? "retry-article" : "retry-library");
+  const path = article ? scopedArticlePath(id, article.id) : libraryPath(id);
+  state.resolving.add(key);
+  button.disabled = true;
+  try {
+    const result = await api(path + "/resolve", { method: "POST" });
+    if (id !== state.id) return;
+    const message = result.queued ? "Статей поставлено в очередь поиска копий · " + numberFormat.format(result.queued)
+      : "Нет статей, которым требуется поиск файла.";
+    if (article && article === state.article) show(byId("attach-status"), message, "secondary");
+    else showNotice(message);
+    await refreshLibraries();
+    await loadIndexStatus();
+    await loadArticles();
+  } catch (error) {
+    if (id !== state.id) return;
+    if (article && article === state.article) show(byId("attach-status"), error.message, "form-error");
+    else showNotice(error.message, true);
+  } finally {
+    state.resolving.delete(key);
+    if (id === state.id && (!article || article === state.article)) button.disabled = false;
+  }
+}
+
+let reader = null;
+
+function readerMode(mode) {
+  if (!reader) return;
+  reader.mode = mode;
+  for (const key of ["text", "pdf", "image"]) {
+    byId("reader-" + key + "-button").setAttribute("aria-pressed", String(mode === key));
+  }
+  byId("reader-frame").hidden = mode !== "pdf";
+  byId("reader-extracted").hidden = mode !== "text";
+  byId("reader-image").hidden = mode !== "image";
+  byId("reader-more").hidden = mode !== "text" || reader.offset === null;
+  if (mode === "pdf" && !byId("reader-frame").hasAttribute("src")) byId("reader-frame").src = reader.pdf;
+  show(byId("reader-status"), mode === "text" ? reader.status : "");
+}
+
+async function loadReaderText(append = false) {
+  const current = reader;
+  const query = new URLSearchParams({ offset: append ? current.offset : 0 });
+  if (current.page) query.set("page", current.page);
+  byId("reader-more").disabled = true;
+  try {
+    const response = await api(scopedArticlePath(current.library, current.source.article_id) + "/passages?" + query);
+    if (current !== reader) return;
+    const target = byId("reader-extracted");
+    if (!append) target.replaceChildren();
+    for (const part of response.passages) {
+      if (!current.page && part.page) target.append(make("h3", "", "Страница " + part.page));
+      target.append(make("p", "", part.text));
+    }
+    current.offset = response.next_offset;
+    current.status = target.childElementCount ? "" : "Текст для этой страницы не извлечён.";
+  } catch (error) {
+    if (current !== reader) return;
+    current.status = "Не удалось получить текст. " + error.message;
+  } finally {
+    if (current === reader) {
+      byId("reader-more").disabled = false;
+      readerMode(current.mode);
+    }
+  }
+}
+
+function openSource(source) {
+  const page = Number.isSafeInteger(source.page) && source.page > 0 ? source.page : null;
+  const pdf = source.pdf_url ? articlePath(source.article_id) + "/pdf?inline=1" + (page ? "#page=" + page : "") : "";
+  const image = page && source.page_image_url ? articlePath(source.article_id) + "/pages/" + page + ".png" : "";
+  reader = { source, library: state.id, page, pdf, offset: null, status: "Загружаем текст источника…" };
+  byId("reader-title").textContent = source.title || "Источник";
+  byId("reader-page").textContent = [page && "Страница " + numberFormat.format(page), source.section,
+    source.doi && "DOI " + source.doi].filter(Boolean).join(" · ");
+  const original = byId("reader-link");
+  original.hidden = !pdf;
+  if (pdf) original.href = pdf;
+  else original.removeAttribute("href");
+  byId("reader-pdf-button").hidden = !pdf;
+  byId("reader-image-button").hidden = !image;
+  byId("reader-frame").removeAttribute("src");
+  byId("reader-extracted").replaceChildren(make("p", "", source.text));
+  if (image) {
+    byId("reader-image").alt = "Страница " + page + " оригинала статьи";
+    byId("reader-image").src = image;
+  }
+  readerMode(image ? "image" : "text");
+  modal("reader-dialog");
+  void loadReaderText();
+}
+
+function renderResearch(answer, sources, model) {
+  const list = byId("citations");
+  list.replaceChildren();
+  const entries = new Map();
+  for (const [index, source] of sources.entries()) {
+    const number = source.number || index + 1;
+    const card = make("li", "citation");
+    card.tabIndex = -1;
+    entries.set(String(number), card);
+    const top = make("div", "citation-heading");
+    top.append(make("span", "citation-number", "[" + number + "]"), make("h4", "", source.title || "Статья"));
+    card.append(top);
+    const meta = [source.doi && "DOI " + source.doi, source.section, source.page && "с. " + source.page].filter(Boolean);
+    if (meta.length) card.append(make("p", "secondary", meta.join(" · ")));
+    card.append(make("blockquote", "", source.text));
+    if (Number.isInteger(source.article_id)) {
+      const open = make("button", "text-button", source.page ? "Открыть страницу " + source.page : "Прочитать источник");
+      open.type = "button";
+      open.addEventListener("click", () => openSource(source));
+      card.append(open);
+    }
+    list.append(card);
+  }
+  const output = byId("research-answer");
+  output.replaceChildren();
+  const fragments = (answer || "").split(/(\[\d+\])/g);
+  for (const fragment of fragments) {
+    const target = /^\[(\d+)\]$/.exec(fragment);
+    const card = target && entries.get(target[1]);
+    if (!card) { output.append(document.createTextNode(fragment)); continue; }
+    const jump = make("button", "citation-jump", fragment);
+    jump.type = "button";
+    jump.setAttribute("aria-label", "К источнику " + target[1]);
+    jump.addEventListener("click", () => { card.focus(); card.scrollIntoView({ block: "nearest" }); });
+    output.append(jump);
+  }
+  byId("answer-heading").hidden = !answer;
+  output.hidden = !answer;
+  show(byId("answer-model"), model ? "Модель ответа · " + model : "");
+  byId("sources-panel").hidden = !sources.length;
+  byId("research-result").hidden = !answer && !sources.length;
+}
+
+async function askLibrary(event) {
+  event.preventDefault();
+  const query = byId("research-question").value.trim();
+  if (!query || !state.id) return;
+  const request = ++state.questionRequest;
+  const action = event.submitter?.value === "search" ? "search" : "ask";
+  const payload = { query };
+  if (action === "ask" && byId("question-model").value) payload.model = byId("question-model").value;
+  const buttons = byId("question-form").querySelectorAll("button");
+  for (const button of buttons) button.disabled = true;
+  byId("research-result").hidden = true;
+  show(byId("question-status"), action === "ask" ? "Ищем источники и готовим ответ…" : "Ищем фрагменты…", "secondary");
+  try {
+    const result = await api(libraryPath(state.id) + "/rag/" + action, sendJson("POST", payload));
+    if (request !== state.questionRequest) return;
+    const sources = Array.isArray(result) ? result : result.sources || [];
+    renderResearch(result.answer, sources, result.model);
+    show(byId("question-status"), sources.length || result.answer ? "" : "В индексе этой библиотеки подходящих фрагментов пока нет.", "secondary");
+  } catch (error) {
+    if (request === state.questionRequest) show(byId("question-status"), error.message, "form-error");
+  } finally {
+    if (request === state.questionRequest) for (const button of buttons) button.disabled = false;
+  }
+}
+
+async function reparseArticle() {
+  const article = state.article;
+  if (!article) return;
+  const id = state.id;
+  const button = byId("reparse-article");
+  button.disabled = true;
+  try {
+    await api(scopedArticlePath(id, article.id) + "/reparse", { method: "POST" });
+    if (state.article === article) {
+      article.parse_status = "pending";
+      article.parse_error = "";
+      setPreviewFiles(article);
+      show(byId("attach-status"), "Файл снова в очереди разбора MinerU.", "secondary");
+    }
+    if (id === state.id) await Promise.all([refreshLibraries(), loadArticles()]);
+  } catch (error) {
+    if (state.article === article) show(byId("attach-status"), error.message, "form-error");
+  } finally { button.disabled = false; }
+}
+
+function updateModelChoices(settings) {
+  state.settings = settings;
+  const list = byId("question-model");
+  const previous = list.value;
+  list.replaceChildren(new Option("По настройкам", ""));
+  const enabled = settings.profiles.filter((profile) => profile.enabled);
+  const names = new Set(enabled.map((profile) => profile.chat_model).filter(Boolean));
+  if (settings.chat_model) names.add(settings.chat_model);
+  for (const name of names) list.add(new Option(name, name));
+  if (names.has(previous)) list.value = previous;
+}
+
+function refreshModelSuggestions() {
+  const rows = [...byId("model-profiles").children];
+  for (const role of ["chat", "embedding"]) {
+    const values = rows.flatMap((row) => [
+      row.querySelector('[name="' + role + '_model"]').value.trim(),
+      ...Array.from(row.querySelector("datalist")?.options || [], (option) => option.value),
+    ]);
+    byId(role + "-choices").replaceChildren(...Array.from(new Set(values.filter(Boolean)), (value) => new Option(value, value)));
+  }
+}
+
+let profileSequence = 0;
+function addProfile(profile, savedIndex) {
+  const row = byId("profile-template").content.firstElementChild.cloneNode(true);
+  profile ||= {
+    name: "", base_url: "", embedding_model: "", chat_model: "", priority: 10, enabled: true,
+    concurrency: 1, chat_mode: "openai", max_tokens: 768,
+    days: [0, 1, 2, 3, 4, 5, 6], start: "", end: "", timezone: "Europe/Moscow",
+  };
+  const field = (key) => row.querySelector('[name="' + key + '"]');
+  for (const key of ["name", "base_url", "embedding_model", "chat_model", "start", "end", "timezone", "priority", "concurrency"]) {
+    field(key).value = profile[key] ?? (key === "concurrency" ? 1 : "");
+  }
+  field("enabled").checked = profile.enabled;
+  field("chat_mode").value = profile.chat_mode || "openai";
+  field("max_tokens").value = profile.max_tokens ?? 768;
+  const days = row.querySelector(".days");
+  ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"].forEach((name, day) => {
+    const label = make("label");
+    const checkbox = make("input");
+    checkbox.type = "checkbox";
+    checkbox.value = day;
+    checkbox.checked = profile.days.includes(day);
+    label.append(checkbox, make("span", "", name));
+    days.append(label);
+  });
+  const schedule = days.closest("details");
+  schedule.open = Boolean(profile.start || profile.end || profile.days.length !== 7);
+  row.querySelector(".remove-profile").addEventListener("click", () => {
+    row.remove();
+    refreshModelSuggestions();
+  });
+  const discovery = row.querySelector(".discover-models");
+  const status = row.querySelector(".discovered-models");
+  const choices = make("datalist");
+  choices.id = "profile-models-" + (++profileSequence);
+  row.append(choices);
+  for (const role of ["embedding_model", "chat_model"]) field(role).setAttribute("list", choices.id);
+  const updateDiscovery = () => {
+    discovery.disabled = savedIndex === undefined || field("base_url").value.trim() !== profile.base_url;
+    status.textContent = discovery.disabled ? "Для запроса списка сначала сохрани адрес сервера." : "";
+  };
+  updateDiscovery();
+  field("base_url").addEventListener("input", updateDiscovery);
+  discovery.addEventListener("click", async () => {
+    discovery.disabled = true;
+    status.textContent = "Запрашиваем список моделей…";
+    try {
+      const result = await api("/api/rag/profiles/" + savedIndex + "/models");
+      choices.replaceChildren(...result.models.map((name) => new Option(name, name)));
+      status.textContent = result.models.length ? "Доступно моделей · " + result.models.length + ". Выбери нужные в полях выше."
+        : "Сервер вернул пустой список.";
+      refreshModelSuggestions();
+    } catch (error) { status.textContent = error.message; }
+    finally { discovery.disabled = field("base_url").value.trim() !== profile.base_url; }
+  });
+  row.addEventListener("change", refreshModelSuggestions);
+  byId("model-profiles").append(row);
+  return row;
+}
+
+function readProfile(row) {
+  const field = (key) => row.querySelector('[name="' + key + '"]');
+  const profile = {
+    enabled: field("enabled").checked, priority: Number(field("priority").value), concurrency: Number(field("concurrency").value),
+    chat_mode: field("chat_mode").value, max_tokens: Number(field("max_tokens").value),
+    days: [...row.querySelectorAll(".days input:checked")].map((checkbox) => Number(checkbox.value)),
+  };
+  for (const key of ["name", "base_url", "embedding_model", "chat_model", "start", "end", "timezone"]) {
+    profile[key] = field(key).value.trim();
+  }
+  return profile;
+}
+
+let modelsRequest = 0;
+async function showModels() {
+  const request = ++modelsRequest;
+  const dialog = modal("models-dialog");
+  byId("models-fields").disabled = true;
+  byId("save-models").disabled = true;
+  byId("model-profiles").replaceChildren();
+  show(byId("models-status"), "Загрузка конфигурации NAS…", "secondary");
+  try {
+    const settings = await api("/api/rag/settings");
+    if (!dialog.open || request !== modelsRequest) return;
+    updateModelChoices(settings);
+    byId("embedding-model").value = settings.embedding_model;
+    byId("chat-model").value = settings.chat_model;
+    byId("qdrant-url").value = settings.qdrant_url || "";
+    settings.profiles.forEach((profile, index) => addProfile(profile, index));
+    refreshModelSuggestions();
+    byId("models-fields").disabled = false;
+    byId("save-models").disabled = false;
+    if (!settings.qdrant_url) byId("qdrant-url").focus();
+    show(byId("models-status"), "");
+  } catch (error) {
+    if (request === modelsRequest) show(byId("models-status"), error.message, "form-error");
+  }
+}
+
+async function saveModels(event) {
+  event.preventDefault();
+  const payload = {
+    embedding_model: byId("embedding-model").value.trim(),
+    chat_model: byId("chat-model").value.trim(),
+    qdrant_url: byId("qdrant-url").value.trim(),
+    profiles: [...byId("model-profiles").children].map(readProfile),
+  };
+  const button = byId("save-models");
+  const request = ++modelsRequest;
+  button.disabled = true;
+  show(byId("models-status"), "Сохраняем конфигурацию…", "secondary");
+  try {
+    const settings = await api("/api/rag/settings", sendJson("PUT", payload));
+    if (request !== modelsRequest) return;
+    updateModelChoices(settings);
+    byId("models-dialog").close();
+    showNotice("Настройки моделей сохранены на NAS.");
+    if (state.id) void loadIndexStatus();
+  } catch (error) {
+    if (request === modelsRequest) show(byId("models-status"), error.message, "form-error");
+  } finally { if (request === modelsRequest) button.disabled = false; }
+}
+
+byId("reparse-article").addEventListener("click", reparseArticle);
+byId("research-settings").addEventListener("click", showModels);
+byId("welcome-connect").addEventListener("click", showModels);
+byId("connect-index-button").addEventListener("click", showModels);
+byId("open-model-settings").addEventListener("click", showModels);
+byId("models-form").addEventListener("submit", saveModels);
+byId("add-profile").addEventListener("click", () => addProfile().querySelector('[name="name"]').focus());
+byId("catalog-view").addEventListener("click", () => setView("catalog"));
+byId("indexed-stat").addEventListener("click", () => setView("research"));
+byId("research-view").addEventListener("click", () => setView("research"));
+for (const button of document.querySelectorAll(".stat[data-scope]")) {
+  button.addEventListener("click", () => selectScope(button.dataset.scope));
+}
+byId("question-form").addEventListener("submit", askLibrary);
+for (const mode of ["text", "pdf", "image"]) {
+  byId("reader-" + mode + "-button").addEventListener("click", () => readerMode(mode));
+}
+byId("reader-image").addEventListener("error", () => {
+  if (!reader) return;
+  byId("reader-image-button").hidden = true;
+  readerMode("text");
+});
+byId("reader-more").addEventListener("click", () => { if (reader?.offset != null) void loadReaderText(true); });
+byId("reader-dialog").addEventListener("close", () => {
+  reader = null;
+  byId("reader-frame").removeAttribute("src");
+  byId("reader-image").removeAttribute("src");
+});
+byId("exclude-article").addEventListener("click", () => showExclusion(state.article));
+byId("exclusion-dialog").addEventListener("close", () => { state.exclusion = null; });
+byId("purge-files").addEventListener("change", (event) => {
+  byId("purge-confirmation").hidden = !event.target.checked;
+  byId("confirm-purge").required = event.target.checked;
+  byId("confirm-purge").checked = false;
+});
+byId("exclusion-form").addEventListener("submit", excludeArticle);
+byId("retry-article").addEventListener("click", () => state.article && resolveFullText(state.article));
+byId("retry-library").addEventListener("click", () => resolveFullText(null));
+
+updateView();
+if (state.view === "research") void api("/api/rag/settings").then(updateModelChoices).catch(() => {});
 void loadSourceTypes().catch(() => null).then(refreshLibraries);
 setInterval(() => {
-  if (document.visibilityState === "visible") void refreshLibraries();
+  if (document.visibilityState === "visible") {
+    void refreshLibraries();
+    void loadIndexStatus();
+  }
 }, 8000);

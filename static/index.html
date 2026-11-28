@@ -24,6 +24,7 @@
                 aria-label="Создать библиотеку" title="Создать библиотеку">+</button>
       </div>
       <nav id="libraries" aria-label="Библиотеки"></nav>
+      <button id="open-model-settings" class="button model-settings-button" type="button">Модели и индексация</button>
     </aside>
 
     <main id="main" tabindex="-1">
@@ -33,6 +34,7 @@
         <h1>Библиотеки</h1>
         <p id="welcome-message">Загрузка списка…</p>
         <button id="welcome-create" class="button primary" type="button" hidden>Создать библиотеку</button>
+        <button id="welcome-connect" class="button" type="button" hidden>Подключить Qdrant и модели</button>
       </section>
       <section id="workspace" hidden>
         <header class="library-header">
@@ -50,24 +52,17 @@
             <input id="upload-folder" type="file" webkitdirectory hidden>
           </div>
         </header>
-        <dl class="library-stats" aria-label="Состав библиотеки">
-          <div class="stat">
-            <dt>Статьи</dt>
-            <dd id="stat-articles">—</dd>
-          </div>
-          <div class="stat">
-            <dt>Полные тексты</dt>
-            <dd id="stat-full-text">—</dd>
-          </div>
-          <div class="stat">
-            <dt>Локальные файлы</dt>
-            <dd id="stat-pdf">—</dd>
-          </div>
-          <div class="stat" id="stat-parse-box" hidden>
-            <dt>Ждут разбора</dt>
-            <dd id="stat-parse">—</dd>
-          </div>
-        </dl>
+        <div class="library-stats" role="group" aria-label="Показать статьи по статусу">
+          <button type="button" class="stat" data-scope="all"><strong id="stat-articles">—</strong>Все статьи</button>
+          <button type="button" class="stat" data-scope="full_text"><strong id="stat-full-text">—</strong>Извлечённые тексты</button>
+          <button type="button" class="stat" id="indexed-stat" aria-controls="research-panel"><strong id="stat-indexed">—</strong>В поиске ИИ</button>
+          <button type="button" class="stat" data-scope="metadata_only"><strong id="stat-metadata">—</strong>Без полного текста</button>
+          <button type="button" class="stat" data-scope="pdf"><strong id="stat-pdf">—</strong>С локальным файлом</button>
+        </div>
+        <div id="connect-index" class="catalog-recovery connect-index" hidden>
+          <p class="secondary">Сбор статей работает. Для поиска по текстам укажи адрес своего Qdrant.</p>
+          <button id="connect-index-button" class="button" type="button">Подключить Qdrant</button>
+        </div>
         <div class="run-strip">
           <div>
             <span id="run-status" class="badge"></span>
@@ -76,7 +71,36 @@
           <button id="show-runs" class="text-button" type="button">Журнал запусков</button>
         </div>
 
-        <section class="article-section" aria-labelledby="articles-heading">
+        <div class="view-switch" role="group" aria-label="Раздел библиотеки">
+          <button id="catalog-view" type="button" aria-controls="catalog-panel" aria-pressed="true">Каталог</button>
+          <button id="research-view" type="button" aria-controls="research-panel" aria-pressed="false">Вопросы по статьям</button>
+        </div>
+        <section id="research-panel" class="article-section research-panel" aria-labelledby="research-heading" hidden>
+          <header class="research-heading">
+            <div><h2 id="research-heading">Вопросы по статьям</h2><p id="rag-status" class="secondary" role="status"></p></div>
+            <button type="button" class="button" id="research-settings">Настроить модели</button>
+          </header>
+          <p id="rag-issue" class="form-error" hidden></p>
+          <form id="question-form" class="question-form">
+            <label for="research-question">Что найти в полных текстах этой библиотеки?</label>
+            <textarea id="research-question" rows="3" maxlength="4000" required placeholder="Например, какие методы измерения load-pull сравнивают авторы?"></textarea>
+            <div class="action-row">
+              <label class="question-model">Модель ответа <select id="question-model"><option value="">По настройкам</option></select></label>
+              <button class="button primary" type="submit" value="ask">Получить ответ с источниками</button>
+              <button class="button" type="submit" value="search">Найти фрагменты</button>
+            </div>
+          </form>
+          <p id="question-status" class="secondary" role="status"></p>
+          <article id="research-result" hidden>
+            <h3 id="answer-heading">Ответ</h3>
+            <div id="research-answer" class="research-answer"></div>
+            <p id="answer-model" class="secondary"></p>
+            <section id="sources-panel" aria-labelledby="citations-heading" hidden>
+              <h3 id="citations-heading">Источники</h3><ol id="citations" class="citations"></ol>
+            </section>
+          </article>
+        </section>
+        <section id="catalog-panel" class="article-section" aria-labelledby="articles-heading">
           <div class="article-toolbar">
             <div class="article-title">
               <h2 id="articles-heading">Каталог</h2>
@@ -96,12 +120,23 @@
               <input id="search" type="search" placeholder="Название, автор, DOI" autocomplete="off">
               <button class="button" type="submit">Найти</button>
             </form>
-            <fieldset class="scope-filter" id="scope-filter">
-              <legend class="sr-only">Показывать статьи с</legend>
-              <label><input type="radio" name="scope" value="all" checked><span>Все</span></label>
-              <label><input type="radio" name="scope" value="full_text"><span>С полным текстом</span></label>
-              <label><input type="radio" name="scope" value="pdf"><span>С файлом</span></label>
-            </fieldset>
+            <label class="catalog-filter">Показать
+              <select id="scope-filter">
+                <option value="all">Все статьи</option>
+                <option value="full_text">С полным текстом</option>
+                <option value="metadata_only">Без полного текста</option>
+                <option value="pdf">С локальным файлом</option>
+                <option value="no_pdf">Нужен файл</option>
+                <option value="parse_pending">В очереди разбора</option>
+                <option value="parse_failed">Ошибки разбора</option>
+                <option value="download_failed">Ошибки загрузки</option>
+                <option value="excluded">Чёрный список</option>
+              </select>
+            </label>
+          </div>
+          <div class="catalog-recovery" id="catalog-recovery" hidden>
+            <p class="secondary" id="discovery-status" role="status">Поиск доступных копий для статей библиотеки.</p>
+            <button class="button" id="retry-library" type="button">Повторить поиск полных текстов</button>
           </div>
           <p id="results-message" class="secondary" role="status"></p>
           <ul id="articles" class="articles" aria-label="Результаты поиска"></ul>
@@ -190,12 +225,19 @@
       <button type="button" class="button button-icon" data-close="article-dialog" aria-label="Закрыть">×</button>
     </header>
     <p id="preview-meta" class="secondary"></p>
+    <p id="preview-folder" class="article-folder" hidden></p>
     <div class="action-row preview-actions">
       <a id="preview-link" class="button" target="_blank" rel="noopener noreferrer" hidden>У издателя ↗</a>
       <a id="preview-pdf" class="button" target="_blank" rel="noopener" hidden>Локальный файл ↗</a>
       <span id="preview-kind" class="badge"></span>
     </div>
     <p id="preview-download" class="secondary" hidden></p>
+    <p id="preview-discovery" class="secondary" hidden></p>
+    <div class="action-row article-management">
+      <button id="retry-article" type="button" class="button">Найти полный текст</button>
+      <button id="reparse-article" type="button" class="button" hidden>Повторить разбор файла</button>
+      <button id="exclude-article" type="button" class="text-button">В чёрный список</button>
+    </div>
     <p id="preview-status" class="secondary" role="status"></p>
     <pre id="preview-text" tabindex="0" aria-label="Текст статьи"></pre>
     <form id="attach-form" class="attach-form">
@@ -208,6 +250,120 @@
     </form>
     <p id="attach-status" role="status" hidden></p>
   </dialog>
+
+  <dialog id="exclusion-dialog" aria-labelledby="exclusion-heading">
+    <header class="dialog-heading"><h2 id="exclusion-heading">Исключить статью</h2>
+      <button type="button" class="button button-icon" data-close="exclusion-dialog" aria-label="Закрыть">×</button></header>
+    <p id="exclusion-title" class="secondary"></p>
+    <form id="exclusion-form" class="workflow-form">
+      <label>Где исключить
+        <select id="exclusion-scope"><option value="library">В этой библиотеке</option><option value="global">Во всех библиотеках</option></select>
+      </label>
+      <p id="exclusion-help" class="secondary"></p>
+      <label class="checkbox"><input id="purge-files" type="checkbox">Удалить сохранённые файлы и текст с диска</label>
+      <label class="checkbox danger-confirm" id="purge-confirmation" hidden>
+        <input id="confirm-purge" type="checkbox">Подтверждаю удаление файлов без возможности восстановления
+      </label>
+      <p class="form-error" id="exclusion-error" role="alert" hidden></p>
+      <footer class="dialog-actions"><button class="button" type="button" data-close="exclusion-dialog">Отмена</button>
+        <button class="button primary" type="submit" id="confirm-exclude">Исключить</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="reader-dialog" aria-labelledby="reader-title">
+    <header class="dialog-heading"><h2 id="reader-title">Источник</h2>
+      <button type="button" class="button button-icon" data-close="reader-dialog" aria-label="Закрыть">×</button></header>
+    <p id="reader-page" class="secondary"></p>
+    <div class="reader-controls" role="group" aria-label="Как показать источник">
+      <button class="button" id="reader-image-button" type="button" hidden>Страница оригинала</button>
+      <button class="button" id="reader-text-button" type="button">Извлечённый текст</button>
+      <button class="button" id="reader-pdf-button" type="button" hidden>Оригинал PDF</button>
+      <a id="reader-link" class="text-button" target="_blank" rel="noopener" hidden>Открыть PDF в новой вкладке ↗</a>
+    </div>
+    <p id="reader-status" class="secondary" role="status"></p>
+    <div id="reader-extracted" class="reader-extracted"></div>
+    <button id="reader-more" class="button" type="button" hidden>Следующие фрагменты</button>
+    <img id="reader-image" alt="" hidden>
+    <iframe id="reader-frame" title="Исходный PDF" hidden></iframe>
+  </dialog>
+
+  <dialog id="models-dialog" aria-labelledby="models-heading">
+    <header class="dialog-heading"><h2 id="models-heading">Модели и индексация</h2>
+      <button type="button" class="button button-icon" data-close="models-dialog" aria-label="Закрыть">×</button></header>
+    <form id="models-form" class="workflow-form">
+      <p class="secondary">Настройки общие для всех библиотек на этом NAS.</p>
+      <fieldset id="models-fields" disabled>
+        <section class="settings-section" id="vector-settings">
+          <h3>Внешний Qdrant</h3>
+          <label>Адрес существующего Qdrant <input id="qdrant-url" type="url" spellcheck="false" placeholder="http://qdrant.lan:6333"></label>
+          <p class="secondary">Укажи адрес REST API отдельного контейнера, доступный с NAS. До подключения Qdrant SciSearcher продолжит собирать статьи. После подключения полные тексты поступят в индекс.</p>
+        </section>
+        <section class="settings-section">
+          <h3>Модели по умолчанию</h3>
+          <div class="form-grid">
+            <label>Эмбеддинги для индекса <input id="embedding-model" type="text" list="embedding-choices" autocomplete="off"></label>
+            <label>Модель ответа <input id="chat-model" type="text" list="chat-choices" autocomplete="off"></label>
+          </div>
+          <datalist id="embedding-choices"></datalist><datalist id="chat-choices"></datalist>
+          <p class="secondary">Смена модели эмбеддингов потребует индексации полных текстов для новой модели.</p>
+        </section>
+        <section class="settings-section">
+          <h3>Серверы моделей</h3>
+          <p class="secondary">Для каждого сервера укажи адрес, доступный с NAS, его модели и часы работы.</p>
+          <div id="model-profiles"></div>
+          <button type="button" id="add-profile" class="button">+ Добавить сервер</button>
+        </section>
+      </fieldset>
+      <p class="secondary" id="models-status" role="status"></p>
+      <footer class="dialog-actions"><button class="button" type="button" data-close="models-dialog">Закрыть</button>
+        <button id="save-models" class="button primary" type="submit" disabled>Сохранить</button></footer>
+    </form>
+  </dialog>
+
+  <template id="profile-template">
+    <fieldset class="model-profile">
+      <legend>Сервер моделей</legend>
+      <div class="profile-actions">
+        <label class="checkbox"><input type="checkbox" name="enabled" checked> Включён</label>
+        <button class="text-button remove-profile" type="button">Убрать сервер</button>
+      </div>
+      <div class="form-grid">
+        <label>Название <input name="name" required placeholder="Рабочая станция"></label>
+        <label>Адрес API <input name="base_url" type="url" required placeholder="http://gpu.lan:8000/v1" spellcheck="false"></label>
+        <label>Модель эмбеддингов <input name="embedding_model" placeholder="Имя модели на сервере" spellcheck="false"></label>
+        <label>Модель ответа <input name="chat_model" placeholder="Имя модели на сервере" spellcheck="false"></label>
+      </div>
+      <p class="secondary">Укажи только те модели, которые обслуживает этот сервер.</p>
+      <div class="form-grid profile-order">
+        <label>Приоритет (0 — первый) <input type="number" name="priority" min="0" max="9999" step="1" required></label>
+        <label>Одновременно запросов <input type="number" name="concurrency" min="1" max="16" step="1" required></label>
+      </div>
+      <details class="model-schedule">
+        <summary>Параметры генерации ответа</summary>
+        <div class="form-grid generation-fields">
+          <label>Протокол ответа
+            <select name="chat_mode">
+              <option value="openai">OpenAI-совместимый API</option>
+              <option value="lmstudio_fast">LM Studio без рассуждений</option>
+            </select>
+          </label>
+          <label>Лимит ответа, токенов <input type="number" name="max_tokens" min="32" max="4096" step="1" required></label>
+        </div>
+      </details>
+      <details class="model-schedule">
+        <summary>Расписание сервера</summary>
+        <div class="days" role="group" aria-label="Дни начала работы"></div>
+        <div class="form-grid hours">
+          <label>С <input type="time" name="start"></label>
+          <label>До <input type="time" name="end"></label>
+          <label>Часовой пояс <input name="timezone" required placeholder="Europe/Moscow"></label>
+        </div>
+        <p class="secondary">Оставь время пустым для работы круглые сутки. Интервал может переходить через полночь.</p>
+      </details>
+      <div class="profile-discovery"><button class="button discover-models" type="button">Получить список моделей</button>
+        <span class="secondary discovered-models" role="status"></span></div>
+    </fieldset>
+  </template>
 
   <dialog id="runs-dialog" aria-labelledby="runs-heading">
     <header class="dialog-heading">

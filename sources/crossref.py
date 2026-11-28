@@ -7,6 +7,7 @@ import threading
 import time
 from collections.abc import Iterator
 from datetime import date
+from urllib.parse import quote, urlsplit
 
 from .common import ISSN_FIELD, fetch_json, is_reusable_license, issn_filter, publication_date, record, web_url
 from .net import get_bytes
@@ -52,7 +53,7 @@ def _crossref_date(item):
     return ""
 
 
-def _crossref_pdf(item) -> tuple[str, str]:
+def _pdf_links(item):
     licenses = {}
     for entry in item.get("license") or []:
         version = entry.get("content-version")
@@ -63,9 +64,24 @@ def _crossref_pdf(item) -> tuple[str, str]:
                 licenses[version] = license_url
     for link in item.get("link") or []:
         license_url = licenses.get(link.get("content-version"))
-        if license_url and link.get("content-type") == "application/pdf" and web_url(link.get("URL")):
-            return link["URL"], license_url
-    return "", ""
+        url = web_url(link.get("URL"))
+        path = urlsplit(url).path.lower()
+        if license_url and url and (link.get("content-type") == "application/pdf"
+                                    or path.endswith((".pdf", "/pdf"))):
+            yield url, license_url
+
+
+def _crossref_pdf(item) -> tuple[str, str]:
+    return next(_pdf_links(item), ("", ""))
+
+
+def resolve(doi, external_id, get):
+    if doi:
+        params = {"mailto": email} if (email := os.getenv("CROSSREF_MAILTO")) else {}
+        item = fetch_json(get, f"{_ENDPOINT}/{quote(doi, safe='/')}", params).get("message") or {}
+        if str(item.get("DOI") or "").lower() == doi:
+            for url, license_url in _pdf_links(item):
+                yield url, license_url, url
 
 
 def _query_params(source: dict, keyword: str, since: date, limit: int) -> dict:

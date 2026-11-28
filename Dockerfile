@@ -5,12 +5,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 INDEXER_HOST=0.0.0.0 INDEXER_DA
 COPY requirements.txt .
 # djvulibre-bin provides ddjvu, which renders DjVu pages to PDF for MinerU.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends djvulibre-bin \
+    && apt-get install -y --no-install-recommends djvulibre-bin poppler-utils \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir -r requirements.txt \
     && mkdir /data \
     && chown 10001:10001 /data
-COPY app.py catalog.py documents.py files.py mineru.py ./
+COPY *.py ./
 COPY sources ./sources
 COPY static ./static
 

@@ -14,6 +14,7 @@ SPEC: SourceSpec = {
     "label": "IEEE Xplore",
     "description": "Поиск по метаданным IEEE Xplore. Требуется ключ IEEE_API_KEY.",
     "mode": "search",
+    "export_abstract": False,
     "fields": [ISSN_FIELD],
 }
 
